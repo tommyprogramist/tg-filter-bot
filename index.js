@@ -437,11 +437,23 @@ async function tryConfirm(page, job) {
   console.log(`match: amount=${job.amount} time="${target.timeText}" delta=${target.rowTimeMs ? (target.rowTimeMs - requestedAtMs) : '?'}ms`);
   try {
     const btn = target.row.locator(SELECTORS.rowConfirmBtn).first();
-    const visible = await btn.isVisible().catch(() => false);
-    if (!visible) {
-      return { ok: false, reason: 'confirm button not visible (already confirmed?)' };
+    // Скроллим строку в видимую область (на случай если таблица имеет overflow)
+    await target.row.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await btn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+
+    const btnCount = await btn.count();
+    const visible = btnCount > 0 ? await btn.isVisible().catch(() => false) : false;
+    console.log(`confirm button: count=${btnCount} visible=${visible}`);
+    if (btnCount === 0) {
+      return { ok: false, reason: 'confirm button not found in row' };
     }
-    await btn.click();
+    if (!visible) {
+      // Попробуем кликнуть форсом — иногда видимость false из-за overflow, а клик проходит
+      console.warn('confirm button reported as not visible, trying force click');
+      await btn.click({ force: true, timeout: 5000 });
+    } else {
+      await btn.click({ timeout: 5000 });
+    }
     console.log('clicked "Подтвердить поступление"');
 
     // Появляется диалог: "Вы уверены, что получили N ars... Я получил всю сумму сделки [✓] | Да, подтвердить"
@@ -495,7 +507,10 @@ async function main() {
   let browser, context, page;
   if (!MOCK_SITE) {
     browser = await chromium.launch({ headless: HEADLESS });
-    const ctxOpts = existsSync(STORAGE_PATH) ? { storageState: STORAGE_PATH } : {};
+    const ctxOpts = {
+      viewport: { width: 1920, height: 1080 },  // широкий viewport чтобы вся таблица влезла
+      ...(existsSync(STORAGE_PATH) ? { storageState: STORAGE_PATH } : {}),
+    };
     context = await browser.newContext(ctxOpts);
     page = await context.newPage();
 
