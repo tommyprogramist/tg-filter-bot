@@ -231,22 +231,40 @@ async function pollForTfaCode() {
   return null;
 }
 
+// Активные статусы — это всё что НЕ в этом списке. Кнопка "Подтвердить" есть
+// даже у завершённых/отклонённых сделок (rocket.do так устроен), поэтому фильтр
+// именно negative по статусу.
+const INACTIVE_STATUS_SUBSTRINGS = [
+  'отклон',     // "Сделка отклонена"
+  'заверш',     // "Завершенная сделка"
+  'отмен',      // "Сделка отменена"
+  'истёк',      // "Истёк"
+  'истек',
+  'expired',
+  'completed',
+  'rejected',
+  'cancelled',
+];
+
+function isStatusActive(statusText) {
+  if (!statusText) return true;  // нет статуса — считаем активной
+  const lower = statusText.toLowerCase();
+  return !INACTIVE_STATUS_SUBSTRINGS.some(s => lower.includes(s));
+}
+
 async function findMatchingRows(page, amount) {
   const rows = page.locator(SELECTORS.rowSelector);
   const count = await rows.count();
   const matches = [];
   for (let i = 0; i < count; i++) {
     const row = rows.nth(i);
-    // Активная сделка = есть кнопка "Подтвердить поступление". Это покрывает все
-    // статусы где можно действовать ("в обработке", "Платеж выполняется" и т.п.).
-    // Отклонённые / завершённые сделки не имеют этой кнопки.
-    const hasConfirmBtn = await row.locator(SELECTORS.rowConfirmBtn).count() > 0;
-    if (!hasConfirmBtn) continue;
+    const statusText = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
+    // Пропускаем только завершённые/отклонённые
+    if (!isStatusActive(statusText)) continue;
 
     const localText = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
     const rowAmount = parseLocalAmount(localText);
     if (rowAmount === amount) {
-      const statusText = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
       const timeText = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
       const rowTimeMs = parseRussianDate(timeText);
       matches.push({ index: i, row, rowTimeMs, localText, timeText, statusText });
