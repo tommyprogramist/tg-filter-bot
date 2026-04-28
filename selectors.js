@@ -1,43 +1,36 @@
 // CSS-селекторы для DOM dashboard'а https://rocket.do/deals-list
 //
-// Структура строки (из реального HTML, см. README):
+// Структура строки (из реального HTML):
 //   <tr class="repay-table__data-row">
 //     <td>...иконка + Статус + Время...</td>     ← cell #1: .td-cell-main = статус, .td-cell-info = время
 //     <td>...USDT-сумма / локальная сумма...</td> ← cell #2: .td-cell-main = USDT, .td-cell-info = "5 000 ars"
 //     <td>...карта...</td>
 //     <td>...устройство...</td>
 //     <td>(пусто)</td>
-//     <td><button>Подтвердить поступление</button></td>  ← cell #6: кнопка confirm
+//     <td><button>Подтвердить поступление</button></td>  ← cell #6
 //
 // Сайт использует Vue 3 + scoped style (data-v-... атрибуты), но классы стабильные.
 
 export const SELECTORS = {
-  // Список заявок (rocket.do)
   rowSelector:        'tr.repay-table__data-row',
 
   // Внутри строки — относительные селекторы
-  rowStatusText:      'td:nth-child(1) .td-cell-main',     // "Сделка отклонена" / "Завершенная сделка"
+  rowStatusText:      'td:nth-child(1) .td-cell-main',     // "Сделка в обработке" / "Сделка отклонена" / "Завершенная сделка"
   rowTimeText:        'td:nth-child(1) .td-cell-info',     // "28 апреля 2026 г. в 03:18"
   rowAmountUsdt:      'td:nth-child(2) .td-cell-main',     // "3.32 USDT"
-  rowAmountLocal:     'td:nth-child(2) .td-cell-info',     // "5 000 ars" — это совпадает с SMS
+  rowAmountLocal:     'td:nth-child(2) .td-cell-info',     // "5 000 ars"
 
-  // Кнопка подтверждения внутри строки. Ищем по тексту: button containing "Подтвердить поступление"
   rowConfirmBtn:      'button:has-text("Подтвердить поступление")',
 
-  // Диалог подтверждения "Вы уверены, что получили N ars на реквизит ..."
-  // Нужно нажать галочку "Я получил всю сумму сделки", потом "Да, подтвердить"
   dialogCheckboxLabel: 'label:has-text("Я получил всю сумму"), :text("Я получил всю сумму сделки")',
   dialogConfirmBtn:    'button:has-text("Да, подтвердить")',
   dialogCancelBtn:     'button:has-text("Отмена")',
 
-  // Индикатор что мы залогинены (видно меню)
   loginSuccessIndicator: 'a[href*="/deals-list"], a[href*="/profile"]',
 
   // Login форма (страница до /deals-list когда сессия истекла).
-  // На rocket.do две формы: trader (email+password) и agent (token).
-  // Используем именно agent-токен.
+  // На rocket.do две формы: trader (email+password) и agent (token). Используем agent.
   loginTokenInput:    'input[placeholder="Секретный токен"], input[placeholder="Secret token"]',
-  // Кнопка «Войти» / «Login» — у формы агента. Используем .last() в коде.
   loginTokenSubmit:   'button.repay-button:has-text("Войти"), button.repay-button:has-text("Login")',
   // 2FA форма после submit токена (6 отдельных input по 1 цифре)
   tfaInputs:          'input.tfa-input__input',
@@ -45,15 +38,27 @@ export const SELECTORS = {
 };
 
 /**
- * Парсит "5 000 ars" / "5000 ars" / "5 500 ars" → 5000 / 5500.
- * Игнорирует пробелы (включая &nbsp;) и валюту.
+ * Парсит "5 000 ars" / "5000.50 ars" / "5 500 ars" / "5000.5" → 5000 / 5000 / 5500 / 5000.
+ * Дробную часть (1-2 цифры после . или ,) отбрасывает.
  */
 export function parseLocalAmount(text) {
   if (!text) return null;
-  const cleaned = String(text).replace(/[ \s]/g, '');
+  // Убираем все пробельные символы (обычные, NBSP  , табы и т.д.)
+  const cleaned = String(text).replace(/\s+/g, '').replace(/ /g, '');
   const m = cleaned.match(/(\d[\d.,]*)/);
   if (!m) return null;
-  const digits = m[1].replace(/[^\d]/g, '');
+  const raw = m[1];
+  const lastDot = raw.lastIndexOf('.');
+  const lastComma = raw.lastIndexOf(',');
+  const lastSep = Math.max(lastDot, lastComma);
+  let intPart = raw;
+  if (lastSep >= 0) {
+    const afterSep = raw.substring(lastSep + 1);
+    if (afterSep.length >= 1 && afterSep.length <= 2 && /^\d+$/.test(afterSep)) {
+      intPart = raw.substring(0, lastSep);
+    }
+  }
+  const digits = intPart.replace(/[^\d]/g, '');
   return digits ? Number(digits) : null;
 }
 
@@ -64,7 +69,6 @@ const RU_MONTHS = {
 
 /**
  * Парсит "28 апреля 2026 г. в 03:18" → timestamp в МСК.
- * Возвращает null если не получается.
  */
 export function parseRussianDate(text) {
   if (!text) return null;
