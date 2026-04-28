@@ -492,33 +492,66 @@ async function tryConfirm(page, job) {
     console.log('clicked "Подтвердить поступление"');
 
     // Появляется диалог: "Вы уверены, что получили N ars... Я получил всю сумму сделки [✓] | Да, подтвердить"
-    const checkboxLabel = page.locator(SELECTORS.dialogCheckboxLabel).first();
+    const checkboxContainer = page.locator(SELECTORS.dialogCheckbox).first();
     try {
-      await checkboxLabel.waitFor({ state: 'visible', timeout: 5000 });
+      await checkboxContainer.waitFor({ state: 'visible', timeout: 5000 });
     } catch {
       return { ok: false, reason: 'confirmation dialog did not appear' };
     }
 
-    // Клик по тексту/label — это активирует галочку (стандартное поведение)
-    try {
-      await checkboxLabel.click();
-      console.log('checkbox clicked');
-    } catch (e) {
-      // Если label сам не кликабелен — пробуем найти input checkbox рядом
-      const cb = page.locator('input[type="checkbox"]').last();
-      await cb.check({ force: true }).catch(() => {});
+    // Активация галочки. У rocket.do <input class="repay-checkbox__input"> внутри <div class="repay-checkbox">.
+    // Клик по контейнеру обычно ловится Vue-handler'ом.
+    const tryCheck = async () => {
+      // 1. Клик по родительскому контейнеру .repay-checkbox
+      try {
+        await checkboxContainer.click({ timeout: 1500 });
+        console.log('checkbox: container clicked');
+        return true;
+      } catch {}
+      // 2. Клик по самому input (force: true, т.к. он может быть скрыт CSS-ом)
+      try {
+        const cb = page.locator(SELECTORS.dialogCheckboxInput).first();
+        await cb.click({ force: true, timeout: 1500 });
+        console.log('checkbox: input force-clicked');
+        return true;
+      } catch {}
+      // 3. JS-фолбэк: ставим checked + диспатчим события для Vue
+      try {
+        const ok = await page.evaluate(() => {
+          const cb = document.querySelector('input.repay-checkbox__input')
+                  || document.querySelectorAll('input[type="checkbox"]')[document.querySelectorAll('input[type="checkbox"]').length - 1];
+          if (!cb) return false;
+          cb.checked = true;
+          cb.dispatchEvent(new Event('input', { bubbles: true }));
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        });
+        if (ok) { console.log('checkbox: set via JS'); return true; }
+      } catch {}
+      return false;
+    };
+
+    const checked = await tryCheck();
+
+    // Проверяем что галочка реально активировалась — кнопка "Да, подтвердить" должна стать enabled
+    let dialogReady = false;
+    if (checked) {
+      const yesBtn = page.locator(SELECTORS.dialogConfirmBtn).first();
+      for (let i = 0; i < 10; i++) {
+        const disabled = await yesBtn.isDisabled().catch(() => true);
+        if (!disabled) { dialogReady = true; break; }
+        await page.waitForTimeout(200);
+      }
+    }
+    if (!dialogReady) {
+      console.warn('checkbox: did not activate confirm button');
+      await captureScreenshot(page, '❌ Галочка не активировала кнопку', job.account_id);
+      return { ok: false, reason: 'checkbox click did not enable confirm button' };
     }
 
-    // Кнопка "Да, подтвердить" — ждём пока станет активной
+    // Кнопка "Да, подтвердить" уже enabled после успешной активации галочки
     const yesBtn = page.locator(SELECTORS.dialogConfirmBtn).first();
-    await yesBtn.waitFor({ state: 'visible', timeout: 3000 });
-    // Подождать пока кнопка перестанет быть disabled
-    for (let i = 0; i < 10; i++) {
-      const disabled = await yesBtn.isDisabled().catch(() => true);
-      if (!disabled) break;
-      await page.waitForTimeout(200);
-    }
-    await yesBtn.click();
+    await yesBtn.click({ timeout: 5000 });
     console.log('clicked "Да, подтвердить"');
 
     // Дождаться закрытия диалога / смены состояния строки

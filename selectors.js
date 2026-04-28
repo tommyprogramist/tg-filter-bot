@@ -20,9 +20,14 @@ export const SELECTORS = {
   rowAmountUsdt:      'td:nth-child(2) .td-cell-main',     // "3.32 USDT"
   rowAmountLocal:     'td:nth-child(2) .td-cell-info',     // "5 000 ars"
 
-  rowConfirmBtn:      'button:has-text("Подтвердить поступление")',
+  // "Подтвердить поступление" — полный вариант. Иногда бывает просто "Подтвердить".
+  rowConfirmBtn:      'button:has-text("Подтвердить")',
 
-  dialogCheckboxLabel: 'label:has-text("Я получил всю сумму"), :text("Я получил всю сумму сделки")',
+  // Конкретные селекторы из HTML rocket.do:
+  // <div class="repay-checkbox"><input class="repay-checkbox__input"><label>...</label></div>
+  dialogCheckbox:      '.repay-checkbox',                    // кликабельный контейнер
+  dialogCheckboxInput: 'input.repay-checkbox__input',         // сам input
+  dialogCheckboxLabel: 'label:has-text("Я получил всю сумму")',  // запасной (для проверки появления диалога)
   dialogConfirmBtn:    'button:has-text("Да, подтвердить")',
   dialogCancelBtn:     'button:has-text("Отмена")',
 
