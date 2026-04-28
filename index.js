@@ -24,13 +24,17 @@ if (!BOT_API_KEY) {
   console.error('FATAL: BOT_API_KEY env not set');
   process.exit(1);
 }
-
 // На Railway сессия передаётся через ENV. При старте декодируем и пишем в файл.
-if (process.env.STORAGE_STATE_BASE64 && !existsSync(STORAGE_PATH)) {
+const SSB = process.env.STORAGE_STATE_BASE64 || '';
+console.log(`STORAGE_STATE_BASE64 env length: ${SSB.length} chars` +
+            (SSB.length > 0 ? `, starts with "${SSB.slice(0, 8)}..."` : ' (empty/unset)'));
+console.log(`storage_state.json file exists: ${existsSync(STORAGE_PATH)}`);
+
+if (SSB && !existsSync(STORAGE_PATH)) {
   try {
-    const decoded = Buffer.from(process.env.STORAGE_STATE_BASE64, 'base64').toString('utf-8');
+    const decoded = Buffer.from(SSB, 'base64').toString('utf-8');
     writeFileSync(STORAGE_PATH, decoded);
-    console.log('storage_state restored from STORAGE_STATE_BASE64');
+    console.log(`storage_state restored from STORAGE_STATE_BASE64 (${decoded.length} chars decoded)`);
   } catch (e) {
     console.error('failed to decode STORAGE_STATE_BASE64:', e.message);
   }
