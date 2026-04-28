@@ -87,13 +87,21 @@ async function notify(type, payload = {}) {
 // Делает скриншот страницы и шлёт в Telegram через сервер
 async function captureScreenshot(page, caption = '', accountId = null) {
   try {
-    const buf = await page.screenshot({ fullPage: false });  // не fullPage — не нужен длинный
+    // JPEG quality 70 — заметно меньше PNG (~50-150 КБ vs 300-700 КБ для 1920×1080)
+    const buf = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 70 });
     const base64 = buf.toString('base64');
-    await botFetch('/bot/screenshot', {
+    console.log(`screenshot taken: ${buf.length} bytes`);
+    const r = await botFetch('/bot/screenshot', {
       method: 'POST',
       body: JSON.stringify({ accountId, caption, base64 }),
     });
-    console.log('screenshot sent');
+    if (r.ok) {
+      const data = await r.json().catch(() => ({}));
+      console.log(`screenshot sent → server OK: ${JSON.stringify(data)}`);
+    } else {
+      const text = await r.text().catch(() => '');
+      console.error(`screenshot server returned ${r.status}: ${text.slice(0, 300)}`);
+    }
   } catch (e) {
     console.error('captureScreenshot failed:', e.message);
   }
@@ -272,6 +280,8 @@ function isStatusActive(statusText) {
 }
 
 async function findMatchingRows(page, amount) {
+  // amount из job может прийти строкой (BIGINT в pg) — приводим к числу
+  const targetAmount = Number(amount);
   const rows = page.locator(SELECTORS.rowSelector);
   const count = await rows.count();
   const matches = [];
@@ -283,7 +293,7 @@ async function findMatchingRows(page, amount) {
 
     const localText = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
     const rowAmount = parseLocalAmount(localText);
-    if (rowAmount === amount) {
+    if (rowAmount === targetAmount) {
       const timeText = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
       const rowTimeMs = parseRussianDate(timeText);
       matches.push({ index: i, row, rowTimeMs, localText, timeText, statusText });
