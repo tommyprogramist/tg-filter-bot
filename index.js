@@ -293,13 +293,14 @@ function pickClosest(matches, requestedAtMs) {
 }
 
 /**
- * Перезагружает страницу со списком сделок, если с прошлого reload прошло >= 2 минут.
- * Если нет — ждёт оставшееся время. Гарантирует что после вызова страница свежая.
+ * Перезагружает страницу со списком сделок.
+ * Если force=true — обновляет немедленно (для срочных задач из очереди).
+ * Если force=false — соблюдает RELOAD_MIN_INTERVAL_MS (для фоновых сканов).
  */
-async function reloadWithRateLimit(page) {
+async function reloadWithRateLimit(page, force = false) {
   const now = Date.now();
   const sinceReload = now - lastReloadAt;
-  if (sinceReload < RELOAD_MIN_INTERVAL_MS && lastReloadAt > 0) {
+  if (!force && sinceReload < RELOAD_MIN_INTERVAL_MS && lastReloadAt > 0) {
     const waitMs = RELOAD_MIN_INTERVAL_MS - sinceReload;
     console.log(`rate-limit: waiting ${Math.round(waitMs/1000)}s before next reload`);
     await page.waitForTimeout(waitMs);
@@ -308,7 +309,7 @@ async function reloadWithRateLimit(page) {
     await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SELECTORS.rowSelector, { timeout: 10_000 }).catch(() => {});
     lastReloadAt = Date.now();
-    console.log('page reloaded');
+    console.log(`page reloaded${force ? ' (forced)' : ''}`);
     return true;
   } catch (e) {
     console.error('reload failed:', e.message);
@@ -389,10 +390,10 @@ async function tryConfirm(page, job) {
   // 1. Сначала пробуем найти на ТЕКУЩЕЙ странице без reload (вдруг строка уже есть)
   let target = await searchOnPage(page, job, requestedAtMs).catch(() => null);
 
-  // 2. Если не нашли — обновляем страницу (с учётом rate-limit) и ищем снова,
+  // 2. Если не нашли — обновляем страницу СРАЗУ (force, без rate-limit) и ищем снова,
   //    с короткими retry'ями (заявка может появиться через секунду-две после пуша).
   if (!target) {
-    await reloadWithRateLimit(page);
+    await reloadWithRateLimit(page, true);  // force — срочный case, не ждём
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
       target = await searchOnPage(page, job, requestedAtMs).catch(() => null);
       if (target) break;
