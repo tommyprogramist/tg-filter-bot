@@ -84,6 +84,21 @@ async function notify(type, payload = {}) {
   }).catch(e => console.error('notify failed:', e.message));
 }
 
+// Делает скриншот страницы и шлёт в Telegram через сервер
+async function captureScreenshot(page, caption = '', accountId = null) {
+  try {
+    const buf = await page.screenshot({ fullPage: false });  // не fullPage — не нужен длинный
+    const base64 = buf.toString('base64');
+    await botFetch('/bot/screenshot', {
+      method: 'POST',
+      body: JSON.stringify({ accountId, caption, base64 }),
+    });
+    console.log('screenshot sent');
+  } catch (e) {
+    console.error('captureScreenshot failed:', e.message);
+  }
+}
+
 function startHeartbeat() {
   setInterval(() => {
     botFetch('/bot/heartbeat', { method: 'POST', body: JSON.stringify({}) })
@@ -403,22 +418,31 @@ async function tryConfirm(page, job) {
 
   if (!target) {
     // Диагностика: выводим что бот реально видит на странице
+    let totalRows = 0;
     try {
       const allRows = page.locator(SELECTORS.rowSelector);
-      const total = await allRows.count();
-      console.log(`DEBUG: ${total} rows visible on page:`);
-      for (let i = 0; i < Math.min(total, 15); i++) {
+      totalRows = await allRows.count();
+      console.log(`DEBUG: ${totalRows} rows visible on page:`);
+      for (let i = 0; i < Math.min(totalRows, 15); i++) {
         const row = allRows.nth(i);
         const status = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '?');
         const amt = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '?');
         const time = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '?');
+        const device = await row.locator('td:nth-child(4) .td-cell-main').innerText().catch(() => '?');
         const parsed = parseLocalAmount(amt);
         const active = isStatusActive(status);
-        console.log(`  row[${i}]: status="${status}" amount="${amt}"→${parsed} time="${time}" active=${active}`);
+        console.log(`  row[${i}]: status="${status}" amount="${amt}"→${parsed} time="${time}" device="${device}" active=${active}`);
       }
     } catch (e) {
       console.error('debug dump failed:', e.message);
     }
+
+    // Скриншот для визуальной отладки
+    await captureScreenshot(
+      page,
+      `❌ amount=${job.amount}: не найдена строка (видно ${totalRows} строк всего)`,
+      job.account_id
+    );
 
     notify('failed', {
       accountId: job.account_id,
@@ -509,7 +533,10 @@ async function main() {
   if (!MOCK_SITE) {
     browser = await chromium.launch({ headless: HEADLESS });
     const ctxOpts = {
-      viewport: { width: 1920, height: 1080 },  // широкий viewport чтобы вся таблица влезла
+      viewport: { width: 1920, height: 1080 },
+      locale: 'ru-RU',
+      timezoneId: 'Europe/Moscow',
+      extraHTTPHeaders: { 'Accept-Language': 'ru-RU,ru;q=0.9' },
       ...(existsSync(STORAGE_PATH) ? { storageState: STORAGE_PATH } : {}),
     };
     context = await browser.newContext(ctxOpts);
