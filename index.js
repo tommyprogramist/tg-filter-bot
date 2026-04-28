@@ -15,11 +15,15 @@ const STORAGE_PATH  = process.env.STORAGE_PATH || './storage_state.json';
 const MOCK_SITE     = process.env.MOCK_SITE === 'true';
 const TFA_POLL_TIMEOUT_MS = 5 * 60 * 1000;  // 5 минут на ввод 2FA пользователем
 const TFA_POLL_INTERVAL_MS = 2000;
+const SITE_SCAN_INTERVAL_MS = 60 * 1000;  // фоновый скан списка сделок каждую минуту
+
+let lastSiteScanAt = 0;
+const SEEN_DEALS = new Map();  // key "time|amount" → { status, parsedAmount }
 const MATCH_WINDOW_MS = 10 * 60 * 1000;  // 10 минут
 const POLL_IDLE_MS    = 2000;
 const RETRY_ATTEMPTS  = 6;
 const RETRY_DELAY_MS  = 500;
-const RELOAD_MIN_INTERVAL_MS = 2 * 60 * 1000;  // не чаще раза в 2 минуты обновляем страницу
+const RELOAD_MIN_INTERVAL_MS = 60 * 1000;  // не чаще раза в 1 минуту обновляем страницу
 
 let lastReloadAt = 0;
 
@@ -312,6 +316,61 @@ async function reloadWithRateLimit(page) {
   }
 }
 
+/**
+ * Фоновый скан страницы — раз в SITE_SCAN_INTERVAL_MS перезагружаем (с rate-limit)
+ * и уведомляем о новых сделках + изменениях статуса (например ушла в отмену).
+ */
+async function scanForNewDeals(page) {
+  if (Date.now() - lastSiteScanAt < SITE_SCAN_INTERVAL_MS) return;
+  console.log('background scan: checking for new/changed deals');
+  await reloadWithRateLimit(page);
+  lastSiteScanAt = Date.now();
+
+  const rows = page.locator(SELECTORS.rowSelector);
+  const count = await rows.count().catch(() => 0);
+
+  const currentKeys = new Set();
+  for (let i = 0; i < count; i++) {
+    const row = rows.nth(i);
+    const status = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
+    const amount = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
+    const time = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
+    if (!time || !amount) continue;
+    const key = `${time}|${amount}`;
+    currentKeys.add(key);
+    const parsedAmount = parseLocalAmount(amount);
+    const prev = SEEN_DEALS.get(key);
+
+    if (!prev) {
+      // Новая сделка — уведомляем только если активная (отклонённые/завершённые
+      // могли уже быть на странице на момент первого запуска бота)
+      if (isStatusActive(status)) {
+        console.log(`new active deal detected: ${amount} ${status} ${time}`);
+        notify('new_deal', {
+          amount: parsedAmount,
+          message: `${status} • ${time}`,
+        });
+      }
+    } else if (prev.status !== status) {
+      // Статус изменился
+      if (!isStatusActive(status) && isStatusActive(prev.status)) {
+        console.log(`deal status changed (active→inactive): ${amount} ${prev.status} → ${status}`);
+        notify('declined', {
+          amount: parsedAmount,
+          message: `Было: "${prev.status}" → стало: "${status}" • ${time}`,
+        });
+      }
+    }
+    SEEN_DEALS.set(key, { status, parsedAmount });
+  }
+
+  // Ограничиваем размер карты — выбрасываем самые старые если > 500
+  if (SEEN_DEALS.size > 500) {
+    const keys = Array.from(SEEN_DEALS.keys());
+    for (let i = 0; i < 200; i++) SEEN_DEALS.delete(keys[i]);
+  }
+}
+
 async function searchOnPage(page, job, requestedAtMs) {
   const matches = await findMatchingRows(page, job.amount);
   if (matches.length === 0) return null;
@@ -342,6 +401,24 @@ async function tryConfirm(page, job) {
   }
 
   if (!target) {
+    // Диагностика: выводим что бот реально видит на странице
+    try {
+      const allRows = page.locator(SELECTORS.rowSelector);
+      const total = await allRows.count();
+      console.log(`DEBUG: ${total} rows visible on page:`);
+      for (let i = 0; i < Math.min(total, 15); i++) {
+        const row = allRows.nth(i);
+        const status = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '?');
+        const amt = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '?');
+        const time = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '?');
+        const parsed = parseLocalAmount(amt);
+        const active = isStatusActive(status);
+        console.log(`  row[${i}]: status="${status}" amount="${amt}"→${parsed} time="${time}" active=${active}`);
+      }
+    } catch (e) {
+      console.error('debug dump failed:', e.message);
+    }
+
     notify('failed', {
       accountId: job.account_id,
       amount: job.amount,
@@ -444,7 +521,13 @@ async function main() {
     let job = null;
     try { job = await fetchNext(); }
     catch (e) { console.error('fetchNext error:', e.message); }
-    if (!job) { await sleep(POLL_IDLE_MS); continue; }
+    if (!job) {
+      // В idle — раз в 5 минут сканируем страницу на новые/изменённые сделки
+      try { await scanForNewDeals(page); }
+      catch (e) { console.error('scanForNewDeals error:', e.message); }
+      await sleep(POLL_IDLE_MS);
+      continue;
+    }
 
     console.log(`picked job #${job.id} source=${job.source} amount=${job.amount}`);
     let result;
