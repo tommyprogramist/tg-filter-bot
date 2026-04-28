@@ -237,15 +237,16 @@ async function findMatchingRows(page, amount) {
   const matches = [];
   for (let i = 0; i < count; i++) {
     const row = rows.nth(i);
-    // Сначала проверяем статус — берём только "в обработке", пропускаем
-    // отклонённые / завершённые
-    const statusText = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
-    const statusLower = statusText.toLowerCase();
-    if (!statusLower.includes('обработ')) continue;  // только "в обработке"
+    // Активная сделка = есть кнопка "Подтвердить поступление". Это покрывает все
+    // статусы где можно действовать ("в обработке", "Платеж выполняется" и т.п.).
+    // Отклонённые / завершённые сделки не имеют этой кнопки.
+    const hasConfirmBtn = await row.locator(SELECTORS.rowConfirmBtn).count() > 0;
+    if (!hasConfirmBtn) continue;
 
     const localText = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
     const rowAmount = parseLocalAmount(localText);
     if (rowAmount === amount) {
+      const statusText = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
       const timeText = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
       const rowTimeMs = parseRussianDate(timeText);
       matches.push({ index: i, row, rowTimeMs, localText, timeText, statusText });
