@@ -689,24 +689,34 @@ async function pollForTfaCode() {
 // Активные статусы — это всё что НЕ в этом списке. Кнопка "Подтвердить" есть
 // даже у завершённых/отклонённых сделок (rocket.do так устроен), поэтому фильтр
 // именно negative по статусу.
-// Завершённые УСПЕШНО — не нужно ничего нажимать (наш бот сам их завершил).
+// Завершённые УСПЕШНО — наш бот сам их закрыл, кнопок нажимать не надо.
 const COMPLETED_STATUS_SUBSTRINGS = [
   'заверш',     // "Завершенная сделка" — наш success
   'completed',
 ];
 
-// Отклонены (rocket.do reject / отмена / истечение) — это failure для трейдера.
+// Истёкшие — rocket.do убил сделку по таймауту, либо юзер создал новую вместо неё.
+// Для трейдера это failure но не активный reject — отдельная семантика.
+const EXPIRED_STATUS_SUBSTRINGS = [
+  'истёк',
+  'истек',
+  'expired',
+  'пользователь создал нов',  // "Пользователь создал новую сделку" — старая истекла
+];
+
+// Отклонены явно (rocket.do reject / трейдер cancel).
 const DECLINED_STATUS_SUBSTRINGS = [
   'отклон',     // "Сделка отклонена"
   'отмен',      // "Сделка отменена"
-  'истёк',      // "Истёк"
-  'истек',
-  'expired',
   'rejected',
   'cancelled',
 ];
 
-const INACTIVE_STATUS_SUBSTRINGS = [...COMPLETED_STATUS_SUBSTRINGS, ...DECLINED_STATUS_SUBSTRINGS];
+const INACTIVE_STATUS_SUBSTRINGS = [
+  ...COMPLETED_STATUS_SUBSTRINGS,
+  ...DECLINED_STATUS_SUBSTRINGS,
+  ...EXPIRED_STATUS_SUBSTRINGS,
+];
 
 function isStatusActive(statusText) {
   if (!statusText) return true;  // нет статуса — считаем активной
@@ -724,6 +734,12 @@ function isStatusCompleted(statusText) {
   if (!statusText) return false;
   const lower = statusText.toLowerCase();
   return COMPLETED_STATUS_SUBSTRINGS.some(s => lower.includes(s));
+}
+
+function isStatusExpired(statusText) {
+  if (!statusText) return false;
+  const lower = statusText.toLowerCase();
+  return EXPIRED_STATUS_SUBSTRINGS.some(s => lower.includes(s));
 }
 
 async function findMatchingRows(page, amount, cardNumber = null) {
@@ -848,13 +864,20 @@ async function scanForNewDeals(page, accountIdOrCtx) {
         });
       }
     } else if (prev.status !== status) {
-      // Сделка перешла из активного состояния в финальное.
-      // 'declined' шлём ТОЛЬКО если статус из decline-семейства (отклонена/отменена/expired).
-      // Если статус 'Завершенная сделка' (наш бот сам её закрыл) — это success,
-      // отдельной нотификации не шлём (была уже 'confirmed' от tryConfirm).
+      // Сделка перешла из активного состояния в финальное. Различаем три исхода:
+      //  — declined (явный reject от rocket.do / cancel) → 🚫
+      //  — expired (таймаут или "пользователь создал новую") → 🕒
+      //  — completed (наш бот сам подтвердил) → молча, 'confirmed' уже летел
       if (isStatusActive(prev.status) && isStatusDeclined(status)) {
         console.log(`[${accountId}] deal DECLINED: ${amount} ${prev.status} → ${status}`);
         notify('declined', {
+          accountId,
+          amount: parsedAmount,
+          message: `Было: "${prev.status}" → стало: "${status}" • ${time}`,
+        });
+      } else if (isStatusActive(prev.status) && isStatusExpired(status)) {
+        console.log(`[${accountId}] deal EXPIRED: ${amount} ${prev.status} → ${status}`);
+        notify('expired', {
           accountId,
           amount: parsedAmount,
           message: `Было: "${prev.status}" → стало: "${status}" • ${time}`,
