@@ -276,6 +276,54 @@ async function ensureLoggedIn(page) {
 }
 
 /**
+ * Чистит 6 ячеек, вводит code через keyboard.press (auto-advance работает корректно),
+ * проверяет что в DOM реально 6 правильных цифр (фолбэк на .fill() если не сошлось),
+ * и кликает submit. Возвращает true если ввод+клик сработали (НЕ означает успех логина).
+ */
+async function fillAndSubmitTfa(page, tfaInputs, code, accountId) {
+  // Чистим (на случай если что-то осталось от предыдущей попытки)
+  for (let i = 0; i < 6; i++) {
+    try { await tfaInputs.nth(i).fill(''); } catch {}
+  }
+  // Кликаем первую ячейку и печатаем все цифры — auto-advance переводит фокус сам
+  try {
+    await tfaInputs.first().click({ timeout: 3000 });
+  } catch (e) {
+    console.warn(`[${accountId}] tfa: click first input failed: ${e.message}`);
+    return false;
+  }
+  for (const ch of code) {
+    await page.keyboard.press(ch, { delay: 30 });
+  }
+  // Верификация: что в DOM на самом деле
+  const filledValues = await tfaInputs.evaluateAll(els => els.map(e => e.value || ''));
+  const joined = filledValues.join('');
+  if (joined !== code) {
+    console.warn(`[${accountId}] tfa: keyboard.press mismatch (got "${joined.replace(/./g, '*')}" len=${joined.length}, want len=${code.length}), retrying via .fill()`);
+    for (let i = 0; i < 6; i++) {
+      try { await tfaInputs.nth(i).fill(''); } catch {}
+    }
+    for (let i = 0; i < 6; i++) {
+      await tfaInputs.nth(i).fill(code[i]);
+    }
+    const recheck = await tfaInputs.evaluateAll(els => els.map(e => e.value || '')).then(v => v.join(''));
+    if (recheck !== code) {
+      console.error(`[${accountId}] tfa: even .fill() fallback didn't match (got len=${recheck.length})`);
+      return false;
+    }
+  }
+  // Submit
+  const tfaSubmitBtn = page.locator(SELECTORS.tfaSubmit + ':not(.disabled):not([disabled])').last();
+  try {
+    await tfaSubmitBtn.waitFor({ state: 'visible', timeout: 5000 });
+    await tfaSubmitBtn.click();
+  } catch {
+    await tfaInputs.nth(5).press('Enter').catch(() => {});
+  }
+  return true;
+}
+
+/**
  * Логин с явными кредами (token + опциональный totpSecret).
  * Используется при многотенантной работе — каждый аккаунт со своими кредами.
  */
@@ -308,41 +356,71 @@ async function performLoginWith(page, token, totpSecret, accountId = '?') {
       return false;
     }
 
-    // Получаем 2FA код
-    let code;
-    if (totpSecret) {
-      const now = Math.floor(Date.now() / 1000);
-      if (30 - (now % 30) < 3) {
-        await new Promise(r => setTimeout(r, ((30 - (now % 30)) + 1) * 1000));
-      }
-      code = generateTotpCode(totpSecret);
-      console.log(`[${accountId}] login: TOTP auto-generated`);
-    } else {
+    // ===== 2FA в режиме реального времени =====
+    // Стратегия: до 3 попыток. Перед каждой ждём начала свежего 30-сек окна
+    // (даёт ~28+ сек на ввод и сабмит — гарантия что код не истечёт). Генерим код
+    // СРАЗУ перед вводом, не заранее. Если сайт код отверг — ждём следующее окно
+    // и пробуем со свежим кодом.
+
+    if (!totpSecret) {
       // Fallback на Telegram (для аккаунтов без TOTP-секрета)
       console.log(`[${accountId}] login: requesting 2FA code via Telegram`);
       await botFetch('/bot/2fa-request', { method: 'POST', body: JSON.stringify({}) });
-      code = await pollForTfaCode();
+      const code = await pollForTfaCode();
       if (!code) {
         console.error(`[${accountId}] login: 2FA code timeout`);
         return false;
       }
+      const ok = await fillAndSubmitTfa(page, tfaInputs, code, accountId);
+      if (!ok) return false;
+      await page.locator(SELECTORS.loginSuccessIndicator).first().waitFor({ timeout: 15_000 });
+      console.log(`[${accountId}] login: success`);
+      return true;
     }
 
-    for (let i = 0; i < 6; i++) {
-      await tfaInputs.nth(i).fill(code[i]);
-    }
+    // TOTP-режим с ретраями
+    const MAX_TFA_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_TFA_ATTEMPTS; attempt++) {
+      // Ждём начала свежего окна. Если до конца текущего < 25 сек — ждём (даём себе
+      // максимум времени). Если только что начали — стартуем сразу.
+      const now = Math.floor(Date.now() / 1000);
+      const remaining = 30 - (now % 30);
+      if (remaining < 25) {
+        console.log(`[${accountId}] login: TOTP attempt ${attempt}/${MAX_TFA_ATTEMPTS} — waiting ${remaining}s for fresh window`);
+        await new Promise(r => setTimeout(r, (remaining + 0.3) * 1000));
+      }
 
-    const tfaSubmitBtn = page.locator(SELECTORS.tfaSubmit + ':not(.disabled):not([disabled])').last();
-    try {
-      await tfaSubmitBtn.waitFor({ state: 'visible', timeout: 5000 });
-      await tfaSubmitBtn.click();
-    } catch {
-      await tfaInputs.nth(5).press('Enter').catch(() => {});
-    }
+      // Генерим код прямо сейчас, на свежем окне
+      const code = generateTotpCode(totpSecret);
+      const genTs = Date.now();
+      console.log(`[${accountId}] login: TOTP attempt ${attempt}/${MAX_TFA_ATTEMPTS} (code=${code[0]}****${code[5]}, fresh 30s window)`);
 
-    await page.locator(SELECTORS.loginSuccessIndicator).first().waitFor({ timeout: 15_000 });
-    console.log(`[${accountId}] login: success`);
-    return true;
+      const filled = await fillAndSubmitTfa(page, tfaInputs, code, accountId);
+      if (!filled) {
+        console.warn(`[${accountId}] login: attempt ${attempt} fill failed`);
+        continue;
+      }
+      console.log(`[${accountId}] login: attempt ${attempt} — submitted, waiting for indicator (${Math.round((Date.now()-genTs)/1000)}s since gen)`);
+
+      // Короткое ожидание индикатора успеха. Если сайт примет код — увидим dashboard.
+      // Если не примет — увидим ошибку или останемся на 2FA-форме.
+      const success = await page.locator(SELECTORS.loginSuccessIndicator).first()
+        .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+      if (success) {
+        console.log(`[${accountId}] login: success on attempt ${attempt}`);
+        return true;
+      }
+
+      // Не залогинило. Проверяем — мы всё ещё на 2FA-форме?
+      const stillOnTfa = await tfaInputs.first().isVisible({ timeout: 1000 }).catch(() => false);
+      if (!stillOnTfa) {
+        console.error(`[${accountId}] login: not on tfa form but no success indicator either, giving up`);
+        return false;
+      }
+      console.warn(`[${accountId}] login: attempt ${attempt} rejected by server, will retry on fresh window`);
+    }
+    console.error(`[${accountId}] login: all ${MAX_TFA_ATTEMPTS} TOTP attempts rejected`);
+    return false;
   } catch (e) {
     console.error(`[${accountId}] performLoginWith error:`, e.message);
     return false;
