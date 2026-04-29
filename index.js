@@ -3,22 +3,61 @@
 // → нажать «Подтвердить поступление» → отчитаться серверу.
 
 import { existsSync, writeFileSync } from 'node:fs';
+import crypto from 'node:crypto';
 import { chromium } from 'playwright-chromium';
 import { SELECTORS, parseLocalAmount, parseRussianDate } from './selectors.js';
+
+// ===== TOTP (Google Authenticator-совместимый генератор) =====
+function base32Decode(s) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0, value = 0;
+  const output = [];
+  for (const c of s.toUpperCase().replace(/=+$/, '')) {
+    const idx = alphabet.indexOf(c);
+    if (idx < 0) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      output.push((value >> (bits - 8)) & 0xFF);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(output);
+}
+
+function generateTotpCode(secret, time = Math.floor(Date.now() / 1000)) {
+  const counter = Math.floor(time / 30);
+  const buf = Buffer.alloc(8);
+  buf.writeBigInt64BE(BigInt(counter));
+  const key = base32Decode(secret);
+  const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0F;
+  const code = ((hmac[offset] & 0x7F) << 24) |
+               (hmac[offset + 1] << 16) |
+               (hmac[offset + 2] << 8) |
+               hmac[offset + 3];
+  return String(code % 1_000_000).padStart(6, '0');
+}
 
 const SERVER_URL    = process.env.SERVER_URL    || 'http://localhost:3000';
 const BOT_API_KEY   = process.env.BOT_API_KEY   || '';
 const REQUESTS_URL  = process.env.ROCKET_REQUESTS_URL || 'https://rocket.do/deals-list';
+// LOGIN_TOKEN/TOTP_SECRET оставлены как fallback для одиночного режима (без БД-кредов)
 const LOGIN_TOKEN   = process.env.LOGIN_TOKEN   || '';
+const TOTP_SECRET   = process.env.ROCKET_TOTP_SECRET || '';
 const HEADLESS      = process.env.HEADLESS !== 'false';
-const STORAGE_PATH  = process.env.STORAGE_PATH || './storage_state.json';
 const MOCK_SITE     = process.env.MOCK_SITE === 'true';
+const ACCOUNT_IDLE_MS = 30 * 60 * 1000;  // закрываем idle-контексты через 30 мин
+const ACCOUNT_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const TFA_POLL_TIMEOUT_MS = 10 * 60 * 1000;  // 10 минут на ввод 2FA пользователем
 const TFA_POLL_INTERVAL_MS = 2000;
 const SITE_SCAN_INTERVAL_MS = 60 * 1000;  // фоновый скан списка сделок каждую минуту
 
 let lastSiteScanAt = 0;
-const SEEN_DEALS = new Map();  // key "time|amount" → { status, parsedAmount }
+const SEEN_DEALS = new Map();  // key "accountId|time|amount" → { status, parsedAmount }
+
+// Multi-tenant: один browser, по контексту на account_id
+const accountContexts = new Map();  // accountId → { context, page, lastUsedAt, lastReloadAt }
 const MATCH_WINDOW_MS = 10 * 60 * 1000;  // 10 минут
 const POLL_IDLE_MS    = 2000;
 const RETRY_ATTEMPTS  = 6;
@@ -114,6 +153,126 @@ function startHeartbeat() {
   }, 10_000);
 }
 
+/**
+ * Получает креды юзера с сервера по account_id.
+ * Возвращает { token, totp_secret, storage_state_base64 } или null если нет.
+ */
+async function fetchAccountCreds(accountId) {
+  try {
+    const r = await botFetch(`/bot/account/${accountId}/state`);
+    if (!r.ok) {
+      console.error(`fetchAccountCreds(${accountId}) → ${r.status}`);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.error('fetchAccountCreds error:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Сохраняет storage_state контекста обратно в БД сервера.
+ */
+async function saveAccountStorage(accountId, context) {
+  try {
+    const state = await context.storageState();
+    const b64 = Buffer.from(JSON.stringify(state)).toString('base64');
+    await botFetch(`/bot/account/${accountId}/state`, {
+      method: 'PUT',
+      body: JSON.stringify({ storage_state_base64: b64 }),
+    });
+    console.log(`[${accountId}] storage saved (${b64.length} chars)`);
+  } catch (e) {
+    console.error(`saveAccountStorage(${accountId}) error:`, e.message);
+  }
+}
+
+/**
+ * Возвращает (или создаёт) browser-context для аккаунта.
+ * Сам логинится если нужно.
+ */
+async function getAccountContext(browser, accountId) {
+  const existing = accountContexts.get(accountId);
+  if (existing) {
+    existing.lastUsedAt = Date.now();
+    return existing;
+  }
+
+  // Берём креды юзера
+  const creds = await fetchAccountCreds(accountId);
+  // Fallback: если есть LOGIN_TOKEN в ENV и БД-кредов нет, используем ENV
+  // (для обратной совместимости пока юзеры не заполнили rocket-креды)
+  const token = creds?.token || LOGIN_TOKEN;
+  const totp = creds?.totp_secret || TOTP_SECRET;
+  const storageB64 = creds?.storage_state_base64 || '';
+
+  if (!token) {
+    throw new Error(`account ${accountId}: no rocket_token (заполни в Профиле сайта)`);
+  }
+
+  // Парсим сохранённый state
+  let storageState;
+  if (storageB64) {
+    try {
+      storageState = JSON.parse(Buffer.from(storageB64, 'base64').toString('utf-8'));
+    } catch (e) {
+      console.warn(`[${accountId}] failed to parse storage state, will re-login`);
+    }
+  }
+
+  console.log(`[${accountId}] creating new browser context`);
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    locale: 'ru-RU',
+    timezoneId: 'Europe/Moscow',
+    extraHTTPHeaders: { 'Accept-Language': 'ru-RU,ru;q=0.9' },
+    ...(storageState ? { storageState } : {}),
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
+  } catch (e) {
+    console.error(`[${accountId}] initial goto failed:`, e.message);
+  }
+
+  // Проверяем залогинены ли (по индикатору). Если нет — делаем логин с кредами юзера.
+  const indicatorVisible = await page.locator(SELECTORS.loginSuccessIndicator)
+    .first().isVisible({ timeout: 2000 }).catch(() => false);
+
+  if (!indicatorVisible) {
+    console.log(`[${accountId}] not logged in, performing login`);
+    const ok = await performLoginWith(page, token, totp, accountId);
+    if (!ok) {
+      await context.close().catch(() => {});
+      throw new Error(`[${accountId}] login failed`);
+    }
+    await saveAccountStorage(accountId, context);
+  } else {
+    console.log(`[${accountId}] already logged in (storage_state valid)`);
+  }
+
+  const entry = { context, page, lastUsedAt: Date.now(), lastReloadAt: Date.now(), accountId };
+  accountContexts.set(accountId, entry);
+  return entry;
+}
+
+/**
+ * Закрывает контексты которые не использовались дольше ACCOUNT_IDLE_MS.
+ */
+async function cleanupIdleContexts() {
+  const now = Date.now();
+  for (const [accountId, entry] of accountContexts) {
+    if (now - entry.lastUsedAt > ACCOUNT_IDLE_MS) {
+      console.log(`[${accountId}] closing idle context (${Math.round((now - entry.lastUsedAt)/60000)} min idle)`);
+      try { await saveAccountStorage(accountId, entry.context); } catch {}
+      try { await entry.context.close(); } catch {}
+      accountContexts.delete(accountId);
+    }
+  }
+}
+
 async function ensureLoggedIn(page) {
   // Если на странице есть индикатор успешного логина — мы уже залогинены
   try {
@@ -128,6 +287,80 @@ async function ensureLoggedIn(page) {
     return false;
   }
   return await performLogin(page);
+}
+
+/**
+ * Логин с явными кредами (token + опциональный totpSecret).
+ * Используется при многотенантной работе — каждый аккаунт со своими кредами.
+ */
+async function performLoginWith(page, token, totpSecret, accountId = '?') {
+  console.log(`[${accountId}] login: filling token`);
+  try {
+    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+
+    const tokenInput = page.locator(SELECTORS.loginTokenInput).first();
+    await tokenInput.waitFor({ state: 'visible', timeout: 10_000 });
+    await tokenInput.fill(token);
+
+    const tokenForm = tokenInput.locator('xpath=ancestor::*[.//button][1]');
+    const submitBtn = (await tokenForm.count() > 0)
+      ? tokenForm.locator(SELECTORS.loginTokenSubmit).first()
+      : page.locator(SELECTORS.loginTokenSubmit).last();
+    await submitBtn.click();
+
+    const tfaInputs = page.locator(SELECTORS.tfaInputs);
+    await tfaInputs.first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
+    const cnt = await tfaInputs.count();
+
+    if (cnt < 6) {
+      // Возможно сразу залогинились без 2FA
+      if (await page.locator(SELECTORS.loginSuccessIndicator).first().isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log(`[${accountId}] login: success without 2FA`);
+        return true;
+      }
+      console.error(`[${accountId}] login: expected 6 tfa inputs, got ${cnt}`);
+      return false;
+    }
+
+    // Получаем 2FA код
+    let code;
+    if (totpSecret) {
+      const now = Math.floor(Date.now() / 1000);
+      if (30 - (now % 30) < 3) {
+        await new Promise(r => setTimeout(r, ((30 - (now % 30)) + 1) * 1000));
+      }
+      code = generateTotpCode(totpSecret);
+      console.log(`[${accountId}] login: TOTP auto-generated`);
+    } else {
+      // Fallback на Telegram (для аккаунтов без TOTP-секрета)
+      console.log(`[${accountId}] login: requesting 2FA code via Telegram`);
+      await botFetch('/bot/2fa-request', { method: 'POST', body: JSON.stringify({}) });
+      code = await pollForTfaCode();
+      if (!code) {
+        console.error(`[${accountId}] login: 2FA code timeout`);
+        return false;
+      }
+    }
+
+    for (let i = 0; i < 6; i++) {
+      await tfaInputs.nth(i).fill(code[i]);
+    }
+
+    const tfaSubmitBtn = page.locator(SELECTORS.tfaSubmit + ':not(.disabled):not([disabled])').last();
+    try {
+      await tfaSubmitBtn.waitFor({ state: 'visible', timeout: 5000 });
+      await tfaSubmitBtn.click();
+    } catch {
+      await tfaInputs.nth(5).press('Enter').catch(() => {});
+    }
+
+    await page.locator(SELECTORS.loginSuccessIndicator).first().waitFor({ timeout: 15_000 });
+    console.log(`[${accountId}] login: success`);
+    return true;
+  } catch (e) {
+    console.error(`[${accountId}] performLoginWith error:`, e.message);
+    return false;
+  }
 }
 
 async function performLogin(page) {
@@ -197,16 +430,30 @@ async function performLogin(page) {
       console.error(`expected 6 tfa inputs, got ${cnt}`);
       return false;
     }
-    console.log('2FA form detected, requesting code from user via Telegram');
+    console.log('2FA form detected');
 
-    // Запрашиваем код у пользователя через сервер
-    await botFetch('/bot/2fa-request', { method: 'POST', body: JSON.stringify({}) });
-    const code = await pollForTfaCode();
-    if (!code) {
-      console.error('2FA code timeout — user did not respond');
-      return false;
+    let code;
+    if (TOTP_SECRET) {
+      // Генерим код сами через TOTP. Если до конца окна (30 сек) осталось <3с —
+      // ждём следующего, чтобы код не успел истечь между набором и сабмитом.
+      const now = Math.floor(Date.now() / 1000);
+      const remaining = 30 - (now % 30);
+      if (remaining < 3) {
+        console.log(`TOTP: ${remaining}s left in window, waiting for next`);
+        await new Promise(r => setTimeout(r, (remaining + 1) * 1000));
+      }
+      code = generateTotpCode(TOTP_SECRET);
+      console.log(`TOTP: auto-generated code (${30 - (Math.floor(Date.now()/1000) % 30)}s valid)`);
+    } else {
+      console.log('TOTP_SECRET not set, requesting code from user via Telegram');
+      await botFetch('/bot/2fa-request', { method: 'POST', body: JSON.stringify({}) });
+      code = await pollForTfaCode();
+      if (!code) {
+        console.error('2FA code timeout — user did not respond');
+        return false;
+      }
+      console.log(`got 2FA code from user`);
     }
-    console.log(`got 2FA code from user`);
 
     // Заполняем 6 input'ов по одной цифре
     for (let i = 0; i < 6; i++) {
@@ -279,25 +526,36 @@ function isStatusActive(statusText) {
   return !INACTIVE_STATUS_SUBSTRINGS.some(s => lower.includes(s));
 }
 
-async function findMatchingRows(page, amount) {
+async function findMatchingRows(page, amount, cardNumber = null) {
   // amount из job может прийти строкой (BIGINT в pg) — приводим к числу
   const targetAmount = Number(amount);
+  // Карту нормализуем — только цифры
+  const targetCard = cardNumber ? String(cardNumber).replace(/\D/g, '') : null;
   const rows = page.locator(SELECTORS.rowSelector);
   const count = await rows.count();
   const matches = [];
   for (let i = 0; i < count; i++) {
     const row = rows.nth(i);
     const statusText = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '');
-    // Пропускаем только завершённые/отклонённые
     if (!isStatusActive(statusText)) continue;
 
     const localText = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
     const rowAmount = parseLocalAmount(localText);
-    if (rowAmount === targetAmount) {
-      const timeText = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
-      const rowTimeMs = parseRussianDate(timeText);
-      matches.push({ index: i, row, rowTimeMs, localText, timeText, statusText });
+    if (rowAmount !== targetAmount) continue;
+
+    // Если задан целевой реквизит — проверяем совпадение
+    if (targetCard) {
+      const cardText = await row.locator(SELECTORS.rowCardNumber).innerText().catch(() => '');
+      const rowCard = String(cardText).replace(/\D/g, '');
+      if (rowCard !== targetCard) {
+        console.log(`  amount=${rowAmount} match but card mismatch: row="${rowCard}" target="${targetCard}"`);
+        continue;
+      }
     }
+
+    const timeText = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
+    const rowTimeMs = parseRussianDate(timeText);
+    matches.push({ index: i, row, rowTimeMs, localText, timeText, statusText });
   }
   return matches;
 }
@@ -319,13 +577,14 @@ function pickClosest(matches, requestedAtMs) {
 
 /**
  * Перезагружает страницу со списком сделок.
- * Если force=true — обновляет немедленно (для срочных задач из очереди).
- * Если force=false — соблюдает RELOAD_MIN_INTERVAL_MS (для фоновых сканов).
+ * ctxEntry — { context, page, lastReloadAt } для конкретного аккаунта.
+ * Если force=true — обновляет немедленно. Иначе соблюдает RELOAD_MIN_INTERVAL_MS.
  */
-async function reloadWithRateLimit(page, force = false) {
+async function reloadWithRateLimit(ctxEntry, force = false) {
+  const page = ctxEntry.page;
   const now = Date.now();
-  const sinceReload = now - lastReloadAt;
-  if (!force && sinceReload < RELOAD_MIN_INTERVAL_MS && lastReloadAt > 0) {
+  const sinceReload = now - (ctxEntry.lastReloadAt || 0);
+  if (!force && sinceReload < RELOAD_MIN_INTERVAL_MS && ctxEntry.lastReloadAt > 0) {
     const waitMs = RELOAD_MIN_INTERVAL_MS - sinceReload;
     console.log(`rate-limit: waiting ${Math.round(waitMs/1000)}s before next reload`);
     await page.waitForTimeout(waitMs);
@@ -333,7 +592,7 @@ async function reloadWithRateLimit(page, force = false) {
   try {
     await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SELECTORS.rowSelector, { timeout: 10_000 }).catch(() => {});
-    lastReloadAt = Date.now();
+    ctxEntry.lastReloadAt = Date.now();
     console.log(`page reloaded${force ? ' (forced)' : ''}`);
     return true;
   } catch (e) {
@@ -346,13 +605,25 @@ async function reloadWithRateLimit(page, force = false) {
  * Фоновый скан страницы — раз в SITE_SCAN_INTERVAL_MS перезагружаем (с rate-limit)
  * и уведомляем о новых сделках + изменениях статуса (например ушла в отмену).
  */
-async function scanForNewDeals(page) {
-  if (Date.now() - lastSiteScanAt < SITE_SCAN_INTERVAL_MS) return;
-  console.log('background scan: checking for new/changed deals');
-  await reloadWithRateLimit(page);
-  lastSiteScanAt = Date.now();
+async function scanForNewDeals(page, accountIdOrCtx) {
+  // Поддержка обоих сигнатур: либо передали ctxEntry, либо page+accountId
+  let ctxEntry, accountId;
+  if (accountIdOrCtx && typeof accountIdOrCtx === 'object' && accountIdOrCtx.page) {
+    ctxEntry = accountIdOrCtx;
+    accountId = ctxEntry.accountId || 'default';
+  } else {
+    accountId = accountIdOrCtx || 'default';
+    // Найдём ctxEntry по странице (для legacy single-tenant вызова)
+    ctxEntry = { page, lastReloadAt: 0 };
+    for (const [aid, e] of accountContexts) {
+      if (e.page === page) { ctxEntry = e; accountId = aid; break; }
+    }
+  }
+  console.log(`[${accountId}] background scan: checking deals`);
+  await reloadWithRateLimit(ctxEntry);
 
-  const rows = page.locator(SELECTORS.rowSelector);
+  const scanPage = ctxEntry.page;
+  const rows = scanPage.locator(SELECTORS.rowSelector);
   const count = await rows.count().catch(() => 0);
 
   const currentKeys = new Set();
@@ -362,26 +633,25 @@ async function scanForNewDeals(page) {
     const amount = await row.locator(SELECTORS.rowAmountLocal).innerText().catch(() => '');
     const time = await row.locator(SELECTORS.rowTimeText).innerText().catch(() => '');
     if (!time || !amount) continue;
-    const key = `${time}|${amount}`;
+    const key = `${accountId}|${time}|${amount}`;
     currentKeys.add(key);
     const parsedAmount = parseLocalAmount(amount);
     const prev = SEEN_DEALS.get(key);
 
     if (!prev) {
-      // Новая сделка — уведомляем только если активная (отклонённые/завершённые
-      // могли уже быть на странице на момент первого запуска бота)
       if (isStatusActive(status)) {
-        console.log(`new active deal detected: ${amount} ${status} ${time}`);
+        console.log(`[${accountId}] new active deal: ${amount} ${status} ${time}`);
         notify('new_deal', {
+          accountId,
           amount: parsedAmount,
           message: `${status} • ${time}`,
         });
       }
     } else if (prev.status !== status) {
-      // Статус изменился
       if (!isStatusActive(status) && isStatusActive(prev.status)) {
-        console.log(`deal status changed (active→inactive): ${amount} ${prev.status} → ${status}`);
+        console.log(`[${accountId}] deal status changed: ${amount} ${prev.status} → ${status}`);
         notify('declined', {
+          accountId,
           amount: parsedAmount,
           message: `Было: "${prev.status}" → стало: "${status}" • ${time}`,
         });
@@ -430,18 +700,19 @@ async function dismissAnyModal(page) {
 }
 
 async function searchOnPage(page, job, requestedAtMs) {
-  const matches = await findMatchingRows(page, job.amount);
+  const matches = await findMatchingRows(page, job.amount, job.card_number);
   if (matches.length === 0) return null;
   return pickClosest(matches, requestedAtMs);
 }
 
-async function tryConfirm(page, job) {
+async function tryConfirm(ctxEntry, job) {
   if (MOCK_SITE) {
     console.log(`[MOCK] would confirm amount=${job.amount} requested_at=${job.requested_at}`);
     await new Promise(r => setTimeout(r, 500));
     return { ok: true };
   }
 
+  const page = ctxEntry.page;
   // Закрываем зависший модал от прошлой попытки (если есть)
   await dismissAnyModal(page);
 
@@ -453,7 +724,7 @@ async function tryConfirm(page, job) {
   // 2. Если не нашли — обновляем страницу СРАЗУ (force, без rate-limit) и ищем снова,
   //    с короткими retry'ями (заявка может появиться через секунду-две после пуша).
   if (!target) {
-    await reloadWithRateLimit(page, true);  // force — срочный case, не ждём
+    await reloadWithRateLimit(ctxEntry, true);
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
       target = await searchOnPage(page, job, requestedAtMs).catch(() => null);
       if (target) break;
@@ -632,35 +903,11 @@ async function main() {
   console.log(`Bot starting. SERVER=${SERVER_URL} REQUESTS=${REQUESTS_URL} HEADLESS=${HEADLESS} MOCK=${MOCK_SITE}`);
   startHeartbeat();
 
-  let browser, context, page;
+  let browser;
   if (!MOCK_SITE) {
     browser = await chromium.launch({ headless: HEADLESS });
-    const ctxOpts = {
-      viewport: { width: 1920, height: 1080 },
-      locale: 'ru-RU',
-      timezoneId: 'Europe/Moscow',
-      extraHTTPHeaders: { 'Accept-Language': 'ru-RU,ru;q=0.9' },
-      ...(existsSync(STORAGE_PATH) ? { storageState: STORAGE_PATH } : {}),
-    };
-    context = await browser.newContext(ctxOpts);
-    page = await context.newPage();
-
-    try {
-      await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
-      lastReloadAt = Date.now();
-    } catch (e) {
-      console.error('initial goto failed:', e.message);
-    }
-
-    const logged = await ensureLoggedIn(page);
-    if (!logged) {
-      console.error('FATAL: could not login (token or 2FA failed). Bot exits, container will restart and try again.');
-      process.exit(1);
-    }
-    try {
-      await context.storageState({ path: STORAGE_PATH });
-      console.log('storage state saved to', STORAGE_PATH);
-    } catch (e) { console.warn('save storage failed:', e.message); }
+    setInterval(() => cleanupIdleContexts().catch(e => console.error('cleanup error:', e.message)),
+                ACCOUNT_CLEANUP_INTERVAL_MS);
   }
 
   while (true) {
@@ -668,23 +915,43 @@ async function main() {
     try { job = await fetchNext(); }
     catch (e) { console.error('fetchNext error:', e.message); }
     if (!job) {
-      // В idle — раз в 5 минут сканируем страницу на новые/изменённые сделки
-      try { await scanForNewDeals(page); }
-      catch (e) { console.error('scanForNewDeals error:', e.message); }
+      // Idle: раз в SITE_SCAN_INTERVAL_MS — фоновый скан для всех загруженных аккаунтов
+      try { await scanAllAccountsForNewDeals(); }
+      catch (e) { console.error('scanAll error:', e.message); }
       await sleep(POLL_IDLE_MS);
       continue;
     }
 
-    console.log(`picked job #${job.id} source=${job.source} amount=${job.amount}`);
+    console.log(`picked job #${job.id} account=${job.account_id} source=${job.source} amount=${job.amount} card=${job.card_number || '—'}`);
     let result;
     try {
-      result = await tryConfirm(page, job);
+      const ctxEntry = MOCK_SITE
+        ? { context: null, page: null, lastReloadAt: 0 }
+        : await getAccountContext(browser, job.account_id);
+      result = await tryConfirm(ctxEntry, job);
+      // После успешной обработки — сохраняем сессию в БД (могла обновиться)
+      if (result.ok && !MOCK_SITE) {
+        await saveAccountStorage(job.account_id, ctxEntry.context);
+      }
     } catch (e) {
       result = { ok: false, reason: e.message };
-      try { await page?.reload(); } catch {}
+      console.error(`job #${job.id} crashed:`, e.message);
     }
     await reportDone(job.id, result.ok, result.ok ? null : result.reason);
     console.log(`job #${job.id} → ${result.ok ? 'DONE' : 'FAILED'}: ${result.reason || ''}`);
+  }
+}
+
+// Фоновый скан всех загруженных контекстов на новые/изменённые сделки
+async function scanAllAccountsForNewDeals() {
+  if (Date.now() - lastSiteScanAt < SITE_SCAN_INTERVAL_MS) return;
+  lastSiteScanAt = Date.now();
+  for (const [accountId, entry] of accountContexts) {
+    try {
+      await scanForNewDeals(entry.page, accountId);
+    } catch (e) {
+      console.error(`[${accountId}] scan error:`, e.message);
+    }
   }
 }
 

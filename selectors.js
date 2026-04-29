@@ -19,6 +19,7 @@ export const SELECTORS = {
   rowTimeText:        'td:nth-child(1) .td-cell-info',     // "28 апреля 2026 г. в 03:18"
   rowAmountUsdt:      'td:nth-child(2) .td-cell-main',     // "3.32 USDT"
   rowAmountLocal:     'td:nth-child(2) .td-cell-info',     // "5 000 ars"
+  rowCardNumber:      'td:nth-child(3) .td-cell-main',     // "0000154600000000177456"
 
   // "Подтвердить поступление" — полный вариант. Иногда бывает просто "Подтвердить".
   rowConfirmBtn:      'button:has-text("Подтвердить")',
