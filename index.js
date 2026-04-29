@@ -331,12 +331,35 @@ async function fillAndSubmitTfa(page, tfaInputs, code, accountId) {
  * Используется при многотенантной работе — каждый аккаунт со своими кредами.
  */
 async function performLoginWith(page, token, totpSecret, accountId = '?') {
-  console.log(`[${accountId}] login: filling token`);
+  console.log(`[${accountId}] login: filling token, current URL=${page.url()}`);
   try {
     await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
 
     const tokenInput = page.locator(SELECTORS.loginTokenInput).first();
-    await tokenInput.waitFor({ state: 'visible', timeout: 10_000 });
+    try {
+      await tokenInput.waitFor({ state: 'visible', timeout: 10_000 });
+    } catch (e) {
+      // Token input не появился — диагностика что на странице
+      console.error(`[${accountId}] login: token input не найден после 10s. URL=${page.url()}`);
+      try {
+        const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+        console.error(`[${accountId}] body preview: "${bodyText.replace(/\s+/g, ' ').trim().slice(0, 500)}"`);
+        const allInputs = await page.locator('input').evaluateAll(els => els.map(e => ({
+          type: e.type || '',
+          name: e.name || '',
+          placeholder: e.placeholder || '',
+          id: e.id || '',
+          className: (e.className || '').slice(0, 60),
+        })));
+        console.error(`[${accountId}] inputs on page (${allInputs.length}): ${JSON.stringify(allInputs).slice(0, 1000)}`);
+        const allButtons = await page.locator('button').evaluateAll(els => els.slice(0, 10).map(e => (e.textContent || '').trim().slice(0, 50)));
+        console.error(`[${accountId}] buttons on page: ${JSON.stringify(allButtons)}`);
+        await captureScreenshot(page, `[${accountId}] login: token input не найден (URL=${page.url()})`, accountId);
+      } catch (e2) {
+        console.error(`[${accountId}] diagnostic dump failed: ${e2.message}`);
+      }
+      return false;
+    }
     await tokenInput.fill(token);
 
     const tokenForm = tokenInput.locator('xpath=ancestor::*[.//button][1]');
