@@ -13,7 +13,7 @@ const LOGIN_TOKEN   = process.env.LOGIN_TOKEN   || '';
 const HEADLESS      = process.env.HEADLESS !== 'false';
 const STORAGE_PATH  = process.env.STORAGE_PATH || './storage_state.json';
 const MOCK_SITE     = process.env.MOCK_SITE === 'true';
-const TFA_POLL_TIMEOUT_MS = 5 * 60 * 1000;  // 5 минут на ввод 2FA пользователем
+const TFA_POLL_TIMEOUT_MS = 10 * 60 * 1000;  // 10 минут на ввод 2FA пользователем
 const TFA_POLL_INTERVAL_MS = 2000;
 const SITE_SCAN_INTERVAL_MS = 60 * 1000;  // фоновый скан списка сделок каждую минуту
 
