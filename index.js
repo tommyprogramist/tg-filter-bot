@@ -46,8 +46,11 @@ const LOGIN_TOKEN   = process.env.LOGIN_TOKEN   || '';
 const TOTP_SECRET   = process.env.ROCKET_TOTP_SECRET || '';
 const HEADLESS      = process.env.HEADLESS !== 'false';
 const MOCK_SITE     = process.env.MOCK_SITE === 'true';
-const ACCOUNT_IDLE_MS = 30 * 60 * 1000;  // закрываем idle-контексты через 30 мин
-const ACCOUNT_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+// Контекст браузера закрываем только при ОЧЕНЬ долгом простое (12 часов).
+// Раньше было 30 мин — это убивало фоновые сканы новых сделок если не было
+// активности. Память на одного аккаунта ~150-200 МБ, для 1-5 юзеров безопасно.
+const ACCOUNT_IDLE_MS = 12 * 60 * 60 * 1000;
+const ACCOUNT_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
 const TFA_POLL_TIMEOUT_MS = 10 * 60 * 1000;  // 10 минут на ввод 2FA пользователем
 const TFA_POLL_INTERVAL_MS = 2000;
 const SITE_SCAN_INTERVAL_MS = 60 * 1000;  // фоновый скан списка сделок каждую минуту
@@ -1022,6 +1025,19 @@ async function main() {
           await saveAccountStorage(job.account_id, ctxEntry.context);
           result = { ok: true };
           console.log(`[${job.account_id}] warmup complete — session saved`);
+        }
+      } else if (job.kind === 'scan') {
+        // Forced scan: создать/восстановить контекст, форсированно перезагрузить страницу,
+        // запустить scanForNewDeals. Игнорируем rate-limit reload'а.
+        if (MOCK_SITE) {
+          result = { ok: true, reason: 'mock: scan skipped' };
+        } else {
+          const ctxEntry = await getAccountContext(browser, job.account_id);
+          // Сбрасываем lastReloadAt чтобы reloadWithRateLimit перезагрузил без ожидания
+          ctxEntry.lastReloadAt = 0;
+          await scanForNewDeals(ctxEntry.page, job.account_id);
+          result = { ok: true };
+          console.log(`[${job.account_id}] forced scan complete`);
         }
       } else {
         const ctxEntry = MOCK_SITE
