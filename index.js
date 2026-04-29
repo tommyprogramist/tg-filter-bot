@@ -397,6 +397,38 @@ async function scanForNewDeals(page) {
   }
 }
 
+/**
+ * Закрывает открытый модал (если есть). Вызывается перед каждой новой попыткой
+ * подтверждения чтобы не было перехвата кликов остатком прошлой сессии.
+ */
+async function dismissAnyModal(page) {
+  try {
+    const modal = page.locator('.repay-modal-wrapper, #modal > div').first();
+    const visible = await modal.isVisible({ timeout: 500 }).catch(() => false);
+    if (!visible) return;
+
+    console.log('open modal detected, closing');
+    // 1) Кнопка "Отмена" в самом модале
+    const cancelBtn = page.locator('button:has-text("Отмена")').first();
+    if (await cancelBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+      await cancelBtn.click({ force: true, timeout: 1500 }).catch(() => {});
+      console.log('modal: clicked Отмена');
+    } else {
+      // 2) Escape
+      await page.keyboard.press('Escape');
+      console.log('modal: pressed Escape');
+    }
+    await page.waitForTimeout(500);
+    // 3) Если всё ещё открыт — клик в пустую область
+    if (await modal.isVisible({ timeout: 500 }).catch(() => false)) {
+      await page.mouse.click(10, 10).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  } catch (e) {
+    console.warn('dismissAnyModal error:', e.message);
+  }
+}
+
 async function searchOnPage(page, job, requestedAtMs) {
   const matches = await findMatchingRows(page, job.amount);
   if (matches.length === 0) return null;
@@ -409,6 +441,9 @@ async function tryConfirm(page, job) {
     await new Promise(r => setTimeout(r, 500));
     return { ok: true };
   }
+
+  // Закрываем зависший модал от прошлой попытки (если есть)
+  await dismissAnyModal(page);
 
   const requestedAtMs = new Date(job.requested_at).getTime();
 
@@ -546,6 +581,7 @@ async function tryConfirm(page, job) {
     if (!dialogReady) {
       console.warn('checkbox: did not activate confirm button');
       await captureScreenshot(page, '❌ Галочка не активировала кнопку', job.account_id);
+      await dismissAnyModal(page);  // закрываем модал чтобы следующие попытки прошли
       return { ok: false, reason: 'checkbox click did not enable confirm button' };
     }
 
@@ -564,6 +600,7 @@ async function tryConfirm(page, job) {
       amount: job.amount,
       reason: e.message,
     });
+    await dismissAnyModal(page);  // закрываем зависший модал
     return { ok: false, reason: 'click failed: ' + e.message };
   }
 }
