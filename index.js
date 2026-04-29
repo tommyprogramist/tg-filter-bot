@@ -908,16 +908,28 @@ async function main() {
       continue;
     }
 
-    console.log(`picked job #${job.id} account=${job.account_id} source=${job.source} amount=${job.amount} card=${job.card_number || '—'}`);
+    console.log(`picked job #${job.id} kind=${job.kind || 'confirm'} account=${job.account_id} source=${job.source} amount=${job.amount} card=${job.card_number || '—'}`);
     let result;
     try {
-      const ctxEntry = MOCK_SITE
-        ? { context: null, page: null, lastReloadAt: 0 }
-        : await getAccountContext(browser, job.account_id);
-      result = await tryConfirm(ctxEntry, job);
-      // После успешной обработки — сохраняем сессию в БД (могла обновиться)
-      if (result.ok && !MOCK_SITE) {
-        await saveAccountStorage(job.account_id, ctxEntry.context);
+      if (job.kind === 'warmup') {
+        // Warmup: просто создать/получить контекст (это вызовет login + сохранит storage_state).
+        if (MOCK_SITE) {
+          result = { ok: true, reason: 'mock: warmup skipped' };
+        } else {
+          const ctxEntry = await getAccountContext(browser, job.account_id);
+          await saveAccountStorage(job.account_id, ctxEntry.context);
+          result = { ok: true };
+          console.log(`[${job.account_id}] warmup complete — session saved`);
+        }
+      } else {
+        const ctxEntry = MOCK_SITE
+          ? { context: null, page: null, lastReloadAt: 0 }
+          : await getAccountContext(browser, job.account_id);
+        result = await tryConfirm(ctxEntry, job);
+        // После успешной обработки — сохраняем сессию в БД (могла обновиться)
+        if (result.ok && !MOCK_SITE) {
+          await saveAccountStorage(job.account_id, ctxEntry.context);
+        }
       }
     } catch (e) {
       result = { ok: false, reason: e.message };
