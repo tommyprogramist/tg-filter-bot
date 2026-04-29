@@ -380,6 +380,7 @@ async function performLoginWith(page, token, totpSecret, accountId = '?') {
 
     // TOTP-режим с ретраями
     const MAX_TFA_ATTEMPTS = 3;
+    const DEBUG_TFA = process.env.DEBUG_TFA === 'true';
     for (let attempt = 1; attempt <= MAX_TFA_ATTEMPTS; attempt++) {
       // Ждём начала свежего окна. Если до конца текущего < 25 сек — ждём (даём себе
       // максимум времени). Если только что начали — стартуем сразу.
@@ -393,7 +394,8 @@ async function performLoginWith(page, token, totpSecret, accountId = '?') {
       // Генерим код прямо сейчас, на свежем окне
       const code = generateTotpCode(totpSecret);
       const genTs = Date.now();
-      console.log(`[${accountId}] login: TOTP attempt ${attempt}/${MAX_TFA_ATTEMPTS} (code=${code[0]}****${code[5]}, fresh 30s window)`);
+      const codeForLog = DEBUG_TFA ? code : `${code[0]}****${code[5]}`;
+      console.log(`[${accountId}] login: TOTP attempt ${attempt}/${MAX_TFA_ATTEMPTS} (code=${codeForLog}, fresh 30s window, server-time=${new Date().toISOString()})`);
 
       const filled = await fillAndSubmitTfa(page, tfaInputs, code, accountId);
       if (!filled) {
@@ -411,7 +413,29 @@ async function performLoginWith(page, token, totpSecret, accountId = '?') {
         return true;
       }
 
-      // Не залогинило. Проверяем — мы всё ещё на 2FA-форме?
+      // === Диагностика: что реально на странице после неудачного сабмита? ===
+      try {
+        const url = page.url();
+        const bodyText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
+        // Ищем характерные тексты ошибок
+        const lower = bodyText.toLowerCase();
+        const errMarkers = [
+          'неверн', 'incorrect', 'invalid', 'wrong', 'expired', 'истек',
+          'too many', 'попыт', 'заблокир', 'block', 'rate limit',
+          'токен', 'token', 'код', 'code',
+        ];
+        const hits = errMarkers.filter(m => lower.includes(m));
+        const preview = bodyText.replace(/\s+/g, ' ').trim().slice(0, 400);
+        console.warn(`[${accountId}] login: attempt ${attempt} REJECTED. url=${url}`);
+        console.warn(`[${accountId}] page text (400 chars): "${preview}"`);
+        if (hits.length) console.warn(`[${accountId}] error markers found in page: ${hits.join(', ')}`);
+        // Скриншот в Telegram — увидим UI с текстом ошибки
+        await captureScreenshot(page, `[${accountId}] 2FA rejected (attempt ${attempt}/${MAX_TFA_ATTEMPTS})`, accountId);
+      } catch (e) {
+        console.warn(`[${accountId}] diagnostic dump failed: ${e.message}`);
+      }
+
+      // Проверяем — мы всё ещё на 2FA-форме?
       const stillOnTfa = await tfaInputs.first().isVisible({ timeout: 1000 }).catch(() => false);
       if (!stillOnTfa) {
         console.error(`[${accountId}] login: not on tfa form but no success indicator either, giving up`);
