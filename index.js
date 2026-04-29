@@ -226,12 +226,21 @@ async function getAccountContext(browser, accountId) {
     console.error(`[${accountId}] initial goto failed:`, e.message);
   }
 
-  // Проверяем залогинены ли (по индикатору). Если нет — делаем логин с кредами юзера.
-  const indicatorVisible = await page.locator(SELECTORS.loginSuccessIndicator)
-    .first().isVisible({ timeout: 2000 }).catch(() => false);
+  // Race: ждём что появится первым — индикатор успеха (значит залогинены)
+  // или форма логина (значит storage_state протух → нужно логиниться).
+  // Vue-SPA на rocket.do рендерится медленно, прежний 2-секундный чек ловил false negatives.
+  const successPromise = page.locator(SELECTORS.loginSuccessIndicator)
+    .first().waitFor({ state: 'visible', timeout: 15_000 })
+    .then(() => 'success').catch(() => null);
+  const loginFormPromise = page.locator(SELECTORS.loginTokenInput)
+    .first().waitFor({ state: 'visible', timeout: 15_000 })
+    .then(() => 'login').catch(() => null);
+  const winner = await Promise.race([successPromise, loginFormPromise]);
 
-  if (!indicatorVisible) {
-    console.log(`[${accountId}] not logged in, performing login`);
+  if (winner === 'success') {
+    console.log(`[${accountId}] already logged in (storage_state valid)`);
+  } else if (winner === 'login') {
+    console.log(`[${accountId}] storage_state expired, login form detected — performing login`);
     const ok = await performLoginWith(page, token, totp, accountId);
     if (!ok) {
       await context.close().catch(() => {});
@@ -239,7 +248,20 @@ async function getAccountContext(browser, accountId) {
     }
     await saveAccountStorage(accountId, context);
   } else {
-    console.log(`[${accountId}] already logged in (storage_state valid)`);
+    // Ни то ни другое за 15 сек — что-то не то. Делаем последний чек на индикатор
+    // (вдруг просто оч медленный рендер) и если нет — фейлим с диагностикой.
+    const lastCheck = await page.locator(SELECTORS.loginSuccessIndicator)
+      .first().isVisible({ timeout: 5000 }).catch(() => false);
+    if (lastCheck) {
+      console.log(`[${accountId}] late indicator detected — assume logged in`);
+    } else {
+      console.error(`[${accountId}] neither login form nor success indicator after 20s. URL=${page.url()}`);
+      try {
+        await captureScreenshot(page, `[${accountId}] login state ambiguous (URL=${page.url()})`, accountId);
+      } catch {}
+      await context.close().catch(() => {});
+      throw new Error(`[${accountId}] login state ambiguous — see screenshot`);
+    }
   }
 
   const entry = { context, page, lastUsedAt: Date.now(), lastReloadAt: Date.now(), accountId };
