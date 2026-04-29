@@ -2,7 +2,6 @@
 // Цикл: poll очередь на сервере → найти на сайте сделку с такой суммой и временем
 // → нажать «Подтвердить поступление» → отчитаться серверу.
 
-import { existsSync, writeFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { chromium } from 'playwright-chromium';
 import { SELECTORS, parseLocalAmount, parseRussianDate } from './selectors.js';
@@ -71,21 +70,8 @@ if (!BOT_API_KEY) {
   process.exit(1);
 }
 
-// На Railway сессия передаётся через ENV. При старте декодируем и пишем в файл.
-const SSB = process.env.STORAGE_STATE_BASE64 || '';
-console.log(`STORAGE_STATE_BASE64 env length: ${SSB.length} chars` +
-            (SSB.length > 0 ? `, starts with "${SSB.slice(0, 8)}..."` : ' (empty/unset)'));
-console.log(`storage_state.json file exists: ${existsSync(STORAGE_PATH)}`);
-
-if (SSB && !existsSync(STORAGE_PATH)) {
-  try {
-    const decoded = Buffer.from(SSB, 'base64').toString('utf-8');
-    writeFileSync(STORAGE_PATH, decoded);
-    console.log(`storage_state restored from STORAGE_STATE_BASE64 (${decoded.length} chars decoded)`);
-  } catch (e) {
-    console.error('failed to decode STORAGE_STATE_BASE64:', e.message);
-  }
-}
+// Multi-tenant: storage_state хранится в БД per-account (users.rocket_storage_state).
+// Загружается в getAccountContext() при создании контекста.
 
 function botFetch(path, init = {}) {
   return fetch(`${SERVER_URL}${path}`, {
