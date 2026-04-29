@@ -58,13 +58,17 @@ const SITE_SCAN_INTERVAL_MS = 60 * 1000;  // фоновый скан списк�
 let lastSiteScanAt = 0;
 const SEEN_DEALS = new Map();  // key "accountId|time|amount" → { status, parsedAmount }
 
+// Счётчик подряд-фейлов логина по аккаунту. После 3 — шлём session_expired.
+const LOGIN_FAIL_THRESHOLD = 3;
+const consecutiveLoginFails = new Map();  // accountId → number
+
 // Multi-tenant: один browser, по контексту на account_id
 const accountContexts = new Map();  // accountId → { context, page, lastUsedAt, lastReloadAt }
 const MATCH_WINDOW_MS = 10 * 60 * 1000;  // 10 минут
-const POLL_IDLE_MS    = 2000;
-const RETRY_ATTEMPTS  = 6;
-const RETRY_DELAY_MS  = 500;
-const RELOAD_MIN_INTERVAL_MS = 60 * 1000;  // не чаще раза в 1 минуту обновляем страницу
+const POLL_IDLE_MS    = 500;             // когда нет задач, ждём 500мс между попытками (было 2000)
+const RETRY_ATTEMPTS  = 8;               // больше попыток с меньшим шагом
+const RETRY_DELAY_MS  = 250;             // 250мс между попытками (было 500) → 8×250 = 2 сек
+const RELOAD_MIN_INTERVAL_MS = 30 * 1000;  // 30 сек минимум между reload (было 60) — для фонового скана
 
 let lastReloadAt = 0;
 
@@ -181,11 +185,31 @@ async function saveAccountStorage(accountId, context) {
  * Возвращает (или создаёт) browser-context для аккаунта.
  * Сам логинится если нужно.
  */
+/**
+ * Инкрементирует счётчик login-фейлов и шлёт session_expired в Telegram
+ * через сервер если достигнут порог (LOGIN_FAIL_THRESHOLD).
+ */
+async function trackLoginFail(accountId) {
+  const cur = (consecutiveLoginFails.get(accountId) || 0) + 1;
+  consecutiveLoginFails.set(accountId, cur);
+  console.warn(`[${accountId}] login fail #${cur}/${LOGIN_FAIL_THRESHOLD}`);
+  if (cur === LOGIN_FAIL_THRESHOLD) {
+    await notify('session_expired', { accountId }).catch(() => {});
+  }
+}
+
 async function getAccountContext(browser, accountId) {
   const existing = accountContexts.get(accountId);
   if (existing) {
-    existing.lastUsedAt = Date.now();
-    return existing;
+    if (existing.needsRelogin) {
+      // Self-healing: ловили 401 на rocket.do → закрываем контекст и пересоздаём.
+      console.log(`[${accountId}] context marked needsRelogin, recreating...`);
+      try { await existing.context.close(); } catch {}
+      accountContexts.delete(accountId);
+    } else {
+      existing.lastUsedAt = Date.now();
+      return existing;
+    }
   }
 
   // Берём креды юзера
@@ -220,6 +244,22 @@ async function getAccountContext(browser, accountId) {
   });
   const page = await context.newPage();
 
+  // Self-healing: ловим 401/403 от rocket.do API. Если поймали — выставляем флаг,
+  // тогда следующий tryConfirm/scan закроет контекст и getAccountContext создаст новый.
+  page.on('response', (response) => {
+    try {
+      const url = response.url();
+      const status = response.status();
+      if ((status === 401 || status === 403) && url.includes('rocket.do')) {
+        const entry = accountContexts.get(accountId);
+        if (entry && !entry.needsRelogin) {
+          entry.needsRelogin = true;
+          console.warn(`[${accountId}] HTTP ${status} on ${url.slice(0, 80)} — marking context for relogin`);
+        }
+      }
+    } catch {}
+  });
+
   try {
     await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
   } catch (e) {
@@ -239,13 +279,16 @@ async function getAccountContext(browser, accountId) {
 
   if (winner === 'success') {
     console.log(`[${accountId}] already logged in (storage_state valid)`);
+    consecutiveLoginFails.set(accountId, 0);  // reset
   } else if (winner === 'login') {
     console.log(`[${accountId}] storage_state expired, login form detected — performing login`);
     const ok = await performLoginWith(page, token, totp, accountId);
     if (!ok) {
       await context.close().catch(() => {});
+      await trackLoginFail(accountId);
       throw new Error(`[${accountId}] login failed`);
     }
+    consecutiveLoginFails.set(accountId, 0);  // успех — сбрасываем счётчик
     await saveAccountStorage(accountId, context);
   } else {
     // Ни то ни другое за 15 сек — что-то не то. Делаем последний чек на индикатор
@@ -254,12 +297,14 @@ async function getAccountContext(browser, accountId) {
       .first().isVisible({ timeout: 5000 }).catch(() => false);
     if (lastCheck) {
       console.log(`[${accountId}] late indicator detected — assume logged in`);
+      consecutiveLoginFails.set(accountId, 0);
     } else {
       console.error(`[${accountId}] neither login form nor success indicator after 20s. URL=${page.url()}`);
       try {
         await captureScreenshot(page, `[${accountId}] login state ambiguous (URL=${page.url()})`, accountId);
       } catch {}
       await context.close().catch(() => {});
+      await trackLoginFail(accountId);
       throw new Error(`[${accountId}] login state ambiguous — see screenshot`);
     }
   }
@@ -644,22 +689,41 @@ async function pollForTfaCode() {
 // Активные статусы — это всё что НЕ в этом списке. Кнопка "Подтвердить" есть
 // даже у завершённых/отклонённых сделок (rocket.do так устроен), поэтому фильтр
 // именно negative по статусу.
-const INACTIVE_STATUS_SUBSTRINGS = [
+// Завершённые УСПЕШНО — не нужно ничего нажимать (наш бот сам их завершил).
+const COMPLETED_STATUS_SUBSTRINGS = [
+  'заверш',     // "Завершенная сделка" — наш success
+  'completed',
+];
+
+// Отклонены (rocket.do reject / отмена / истечение) — это failure для трейдера.
+const DECLINED_STATUS_SUBSTRINGS = [
   'отклон',     // "Сделка отклонена"
-  'заверш',     // "Завершенная сделка"
   'отмен',      // "Сделка отменена"
   'истёк',      // "Истёк"
   'истек',
   'expired',
-  'completed',
   'rejected',
   'cancelled',
 ];
+
+const INACTIVE_STATUS_SUBSTRINGS = [...COMPLETED_STATUS_SUBSTRINGS, ...DECLINED_STATUS_SUBSTRINGS];
 
 function isStatusActive(statusText) {
   if (!statusText) return true;  // нет статуса — считаем активной
   const lower = statusText.toLowerCase();
   return !INACTIVE_STATUS_SUBSTRINGS.some(s => lower.includes(s));
+}
+
+function isStatusDeclined(statusText) {
+  if (!statusText) return false;
+  const lower = statusText.toLowerCase();
+  return DECLINED_STATUS_SUBSTRINGS.some(s => lower.includes(s));
+}
+
+function isStatusCompleted(statusText) {
+  if (!statusText) return false;
+  const lower = statusText.toLowerCase();
+  return COMPLETED_STATUS_SUBSTRINGS.some(s => lower.includes(s));
 }
 
 async function findMatchingRows(page, amount, cardNumber = null) {
@@ -784,13 +848,20 @@ async function scanForNewDeals(page, accountIdOrCtx) {
         });
       }
     } else if (prev.status !== status) {
-      if (!isStatusActive(status) && isStatusActive(prev.status)) {
-        console.log(`[${accountId}] deal status changed: ${amount} ${prev.status} → ${status}`);
+      // Сделка перешла из активного состояния в финальное.
+      // 'declined' шлём ТОЛЬКО если статус из decline-семейства (отклонена/отменена/expired).
+      // Если статус 'Завершенная сделка' (наш бот сам её закрыл) — это success,
+      // отдельной нотификации не шлём (была уже 'confirmed' от tryConfirm).
+      if (isStatusActive(prev.status) && isStatusDeclined(status)) {
+        console.log(`[${accountId}] deal DECLINED: ${amount} ${prev.status} → ${status}`);
         notify('declined', {
           accountId,
           amount: parsedAmount,
           message: `Было: "${prev.status}" → стало: "${status}" • ${time}`,
         });
+      } else if (isStatusActive(prev.status) && isStatusCompleted(status)) {
+        console.log(`[${accountId}] deal COMPLETED (success): ${amount} ${prev.status} → ${status}`);
+        // Молча; 'confirmed' уже был отправлен tryConfirm'ом
       }
     }
     SEEN_DEALS.set(key, { status, parsedAmount });
@@ -810,7 +881,7 @@ async function scanForNewDeals(page, accountIdOrCtx) {
 async function dismissAnyModal(page) {
   try {
     const modal = page.locator('.repay-modal-wrapper, #modal > div').first();
-    const visible = await modal.isVisible({ timeout: 500 }).catch(() => false);
+    const visible = await modal.isVisible({ timeout: 150 }).catch(() => false);
     if (!visible) return;
 
     console.log('open modal detected, closing');
@@ -824,11 +895,11 @@ async function dismissAnyModal(page) {
       await page.keyboard.press('Escape');
       console.log('modal: pressed Escape');
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(200);
     // 3) Если всё ещё открыт — клик в пустую область
-    if (await modal.isVisible({ timeout: 500 }).catch(() => false)) {
+    if (await modal.isVisible({ timeout: 200 }).catch(() => false)) {
       await page.mouse.click(10, 10).catch(() => {});
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(150);
     }
   } catch (e) {
     console.warn('dismissAnyModal error:', e.message);
@@ -904,13 +975,8 @@ async function tryConfirm(ctxEntry, job) {
     return { ok: false, reason: `no row with amount=${job.amount} after reload` };
   }
 
-  // Уведомление: сделка найдена
-  notify('found', {
-    accountId: job.account_id,
-    amount: job.amount,
-    message: `Время на сайте: ${target.timeText}`,
-  });
-
+  // Лог в stdout — для дебага. В Telegram больше не шлём (шум), пользователь
+  // увидит итог: confirmed, failed или declined.
   console.log(`match: amount=${job.amount} time="${target.timeText}" delta=${target.rowTimeMs ? (target.rowTimeMs - requestedAtMs) : '?'}ms`);
   try {
     const btn = target.row.locator(SELECTORS.rowConfirmBtn).first();
@@ -940,7 +1006,7 @@ async function tryConfirm(ctxEntry, job) {
     // Появляется диалог: "Вы уверены, что получили N ars... Я получил всю сумму сделки [✓] | Да, подтвердить"
     const checkboxContainer = page.locator(SELECTORS.dialogCheckbox).first();
     try {
-      await checkboxContainer.waitFor({ state: 'visible', timeout: 5000 });
+      await checkboxContainer.waitFor({ state: 'visible', timeout: 2500 });
     } catch {
       return { ok: false, reason: 'confirmation dialog did not appear' };
     }
@@ -960,14 +1026,14 @@ async function tryConfirm(ctxEntry, job) {
         const cb = document.querySelector('input.repay-checkbox__input');
         if (cb) cb.click();
       });
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(120);
       if (await isConfirmEnabled()) { console.log('checkbox: native cb.click() worked'); dialogReady = true; }
     } catch {}
 
     // 2. Клик по контейнеру через Playwright (force)
     if (!dialogReady) {
       try {
-        await checkboxContainer.click({ force: true, timeout: 1500 });
+        await checkboxContainer.click({ force: true, timeout: 800 });
         await page.waitForTimeout(300);
         if (await isConfirmEnabled()) { console.log('checkbox: container click worked'); dialogReady = true; }
       } catch {}
@@ -977,7 +1043,7 @@ async function tryConfirm(ctxEntry, job) {
     if (!dialogReady) {
       try {
         const cb = page.locator(SELECTORS.dialogCheckboxInput).first();
-        await cb.click({ force: true, timeout: 1500 });
+        await cb.click({ force: true, timeout: 800 });
         await page.waitForTimeout(300);
         if (await isConfirmEnabled()) { console.log('checkbox: input force click worked'); dialogReady = true; }
       } catch {}
@@ -987,7 +1053,7 @@ async function tryConfirm(ctxEntry, job) {
     if (!dialogReady) {
       try {
         const lbl = page.locator(SELECTORS.dialogCheckboxLabel).first();
-        await lbl.click({ force: true, timeout: 1500 });
+        await lbl.click({ force: true, timeout: 800 });
         await page.waitForTimeout(300);
         if (await isConfirmEnabled()) { console.log('checkbox: label click worked'); dialogReady = true; }
       } catch {}
@@ -1020,8 +1086,10 @@ async function tryConfirm(ctxEntry, job) {
     await yesBtn.click({ timeout: 5000 });
     console.log('clicked "Да, подтвердить"');
 
-    // Дождаться закрытия диалога / смены состояния строки
-    await page.waitForTimeout(1500);
+    // Не ждём фиксированный таймер. Ждём пока модал закроется (max 1.5 сек) — если
+    // закрылся быстрее, идём дальше.
+    await page.locator('.repay-modal-wrapper, #modal > div')
+      .first().waitFor({ state: 'detached', timeout: 1500 }).catch(() => {});
     notify('confirmed', { accountId: job.account_id, amount: job.amount });
     return { ok: true };
   } catch (e) {
