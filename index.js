@@ -545,16 +545,34 @@ async function performLoginWith(page, token, totpSecret, accountId = '?') {
     await submitBtn.click();
 
     const tfaInputs = page.locator(SELECTORS.tfaInputs);
-    await tfaInputs.first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
-    const cnt = await tfaInputs.count();
+    // Race: ждём что появится первым после submit'а токена.
+    //  — 2FA inputs (нормальный флоу с 2FA)
+    //  — индикатор успеха (если 2FA отключён на rocket-аккаунте)
+    //  — таймаут 30 сек (Vue-SPA медленно рендерит, особенно на cold-pageload)
+    const tfaPromise = tfaInputs.first().waitFor({ state: 'visible', timeout: 30_000 })
+      .then(() => 'tfa').catch(() => null);
+    const successPromise2 = page.locator(SELECTORS.loginSuccessIndicator)
+      .first().waitFor({ state: 'visible', timeout: 30_000 })
+      .then(() => 'success').catch(() => null);
+    const winner = await Promise.race([tfaPromise, successPromise2]);
 
+    if (winner === 'success') {
+      console.log(`[${accountId}] login: success without 2FA`);
+      return true;
+    }
+
+    const cnt = await tfaInputs.count();
     if (cnt < 6) {
-      // Возможно сразу залогинились без 2FA
+      // Двойная проверка — иногда индикатор появляется чуть после tfaInputs не показались
       if (await page.locator(SELECTORS.loginSuccessIndicator).first().isVisible({ timeout: 3000 }).catch(() => false)) {
-        console.log(`[${accountId}] login: success without 2FA`);
+        console.log(`[${accountId}] login: late success without 2FA`);
         return true;
       }
-      console.error(`[${accountId}] login: expected 6 tfa inputs, got ${cnt}`);
+      // Диагностика что на странице — поможет если rocket.do отверг токен
+      const url = page.url();
+      const bodyPreview = await page.locator('body').innerText({ timeout: 2000 })
+        .catch(() => '').then(t => t.replace(/\s+/g, ' ').trim().slice(0, 200));
+      console.error(`[${accountId}] login: expected 6 tfa inputs, got ${cnt}. URL=${url} body="${bodyPreview}"`);
       return false;
     }
 
