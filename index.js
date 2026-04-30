@@ -147,16 +147,30 @@ function startHeartbeat() {
 }
 
 /**
- * Получает креды юзера с сервера по account_id.
- * Возвращает { token, totp_secret, storage_state_base64 } или null если нет.
+ * Получает креды rocket-аккаунта по rocket_account_id (новый путь).
+ * Возвращает { token, totp_secret, storage_state_base64, account_id } или null.
+ */
+async function fetchRocketAccountCreds(rocketAccountId) {
+  try {
+    const r = await botFetch(`/bot/rocket-account/${rocketAccountId}/state`);
+    if (!r.ok) {
+      console.error(`fetchRocketAccountCreds(${rocketAccountId}) → ${r.status}`);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.error('fetchRocketAccountCreds error:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Legacy: получает креды по account_id (для job'ов без rocket_account_id — fallback).
  */
 async function fetchAccountCreds(accountId) {
   try {
     const r = await botFetch(`/bot/account/${accountId}/state`);
-    if (!r.ok) {
-      console.error(`fetchAccountCreds(${accountId}) → ${r.status}`);
-      return null;
-    }
+    if (!r.ok) return null;
     return await r.json();
   } catch (e) {
     console.error('fetchAccountCreds error:', e.message);
@@ -165,8 +179,23 @@ async function fetchAccountCreds(accountId) {
 }
 
 /**
- * Сохраняет storage_state контекста обратно в БД сервера.
+ * Сохраняет storage_state в БД для конкретного rocket-аккаунта.
  */
+async function saveRocketAccountStorage(rocketAccountId, context) {
+  try {
+    const state = await context.storageState();
+    const b64 = Buffer.from(JSON.stringify(state)).toString('base64');
+    await botFetch(`/bot/rocket-account/${rocketAccountId}/state`, {
+      method: 'PUT',
+      body: JSON.stringify({ storage_state_base64: b64 }),
+    });
+    console.log(`[ra=${rocketAccountId}] storage saved (${b64.length} chars)`);
+  } catch (e) {
+    console.error(`saveRocketAccountStorage(${rocketAccountId}) error:`, e.message);
+  }
+}
+
+// Legacy fallback (для старых job'ов без rocket_account_id)
 async function saveAccountStorage(accountId, context) {
   try {
     const state = await context.storageState();
@@ -175,7 +204,6 @@ async function saveAccountStorage(accountId, context) {
       method: 'PUT',
       body: JSON.stringify({ storage_state_base64: b64 }),
     });
-    console.log(`[${accountId}] storage saved (${b64.length} chars)`);
   } catch (e) {
     console.error(`saveAccountStorage(${accountId}) error:`, e.message);
   }
@@ -189,52 +217,55 @@ async function saveAccountStorage(accountId, context) {
  * Инкрементирует счётчик login-фейлов и шлёт session_expired в Telegram
  * через сервер если достигнут порог (LOGIN_FAIL_THRESHOLD).
  */
-async function trackLoginFail(accountId) {
-  const cur = (consecutiveLoginFails.get(accountId) || 0) + 1;
-  consecutiveLoginFails.set(accountId, cur);
-  console.warn(`[${accountId}] login fail #${cur}/${LOGIN_FAIL_THRESHOLD}`);
+async function trackLoginFail(key, accountIdForNotify) {
+  const cur = (consecutiveLoginFails.get(key) || 0) + 1;
+  consecutiveLoginFails.set(key, cur);
+  console.warn(`[${key}] login fail #${cur}/${LOGIN_FAIL_THRESHOLD}`);
   if (cur === LOGIN_FAIL_THRESHOLD) {
-    await notify('session_expired', { accountId }).catch(() => {});
+    await notify('session_expired', { accountId: accountIdForNotify }).catch(() => {});
   }
 }
 
-async function getAccountContext(browser, accountId) {
-  const existing = accountContexts.get(accountId);
+/**
+ * Возвращает (или создаёт) browser-context для конкретного rocket-аккаунта.
+ * Ключ контекста — rocketAccountId (number). Один сайт-юзер может иметь
+ * несколько rocket-аккаунтов и для каждого — свой контекст.
+ */
+async function getContextByRocketAccountId(browser, rocketAccountId) {
+  const key = `ra:${rocketAccountId}`;
+  const existing = accountContexts.get(key);
   if (existing) {
     if (existing.needsRelogin) {
-      // Self-healing: ловили 401 на rocket.do → закрываем контекст и пересоздаём.
-      console.log(`[${accountId}] context marked needsRelogin, recreating...`);
+      console.log(`[ra=${rocketAccountId}] context marked needsRelogin, recreating...`);
       try { await existing.context.close(); } catch {}
-      accountContexts.delete(accountId);
+      accountContexts.delete(key);
     } else {
       existing.lastUsedAt = Date.now();
       return existing;
     }
   }
 
-  // Берём креды юзера
-  const creds = await fetchAccountCreds(accountId);
-  // Fallback: если есть LOGIN_TOKEN в ENV и БД-кредов нет, используем ENV
-  // (для обратной совместимости пока юзеры не заполнили rocket-креды)
-  const token = creds?.token || LOGIN_TOKEN;
-  const totp = creds?.totp_secret || TOTP_SECRET;
-  const storageB64 = creds?.storage_state_base64 || '';
+  const creds = await fetchRocketAccountCreds(rocketAccountId);
+  if (!creds) throw new Error(`rocket-account ${rocketAccountId}: not found on server`);
+  const token = creds.token || LOGIN_TOKEN;
+  const totp = creds.totp_secret || TOTP_SECRET;
+  const storageB64 = creds.storage_state_base64 || '';
+  const accountId = creds.account_id || `ra-${rocketAccountId}`;  // для логов и нотификаций
 
   if (!token) {
-    throw new Error(`account ${accountId}: no rocket_token (заполни в Профиле сайта)`);
+    throw new Error(`rocket-account ${rocketAccountId}: no rocket_token (заполни в Профиле)`);
   }
 
-  // Парсим сохранённый state
   let storageState;
   if (storageB64) {
     try {
       storageState = JSON.parse(Buffer.from(storageB64, 'base64').toString('utf-8'));
     } catch (e) {
-      console.warn(`[${accountId}] failed to parse storage state, will re-login`);
+      console.warn(`[ra=${rocketAccountId}] failed to parse storage state, will re-login`);
     }
   }
 
-  console.log(`[${accountId}] creating new browser context`);
+  console.log(`[ra=${rocketAccountId}] creating new browser context (acc=${accountId})`);
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     locale: 'ru-RU',
@@ -244,17 +275,15 @@ async function getAccountContext(browser, accountId) {
   });
   const page = await context.newPage();
 
-  // Self-healing: ловим 401/403 от rocket.do API. Если поймали — выставляем флаг,
-  // тогда следующий tryConfirm/scan закроет контекст и getAccountContext создаст новый.
   page.on('response', (response) => {
     try {
       const url = response.url();
       const status = response.status();
       if ((status === 401 || status === 403) && url.includes('rocket.do')) {
-        const entry = accountContexts.get(accountId);
+        const entry = accountContexts.get(key);
         if (entry && !entry.needsRelogin) {
           entry.needsRelogin = true;
-          console.warn(`[${accountId}] HTTP ${status} on ${url.slice(0, 80)} — marking context for relogin`);
+          console.warn(`[ra=${rocketAccountId}] HTTP ${status} on ${url.slice(0, 80)} — marking for relogin`);
         }
       }
     } catch {}
@@ -263,12 +292,9 @@ async function getAccountContext(browser, accountId) {
   try {
     await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' });
   } catch (e) {
-    console.error(`[${accountId}] initial goto failed:`, e.message);
+    console.error(`[ra=${rocketAccountId}] initial goto failed:`, e.message);
   }
 
-  // Race: ждём что появится первым — индикатор успеха (значит залогинены)
-  // или форма логина (значит storage_state протух → нужно логиниться).
-  // Vue-SPA на rocket.do рендерится медленно, прежний 2-секундный чек ловил false negatives.
   const successPromise = page.locator(SELECTORS.loginSuccessIndicator)
     .first().waitFor({ state: 'visible', timeout: 15_000 })
     .then(() => 'success').catch(() => null);
@@ -278,39 +304,119 @@ async function getAccountContext(browser, accountId) {
   const winner = await Promise.race([successPromise, loginFormPromise]);
 
   if (winner === 'success') {
-    console.log(`[${accountId}] already logged in (storage_state valid)`);
-    consecutiveLoginFails.set(accountId, 0);  // reset
+    console.log(`[ra=${rocketAccountId}] already logged in (storage_state valid)`);
+    consecutiveLoginFails.set(key, 0);
   } else if (winner === 'login') {
-    console.log(`[${accountId}] storage_state expired, login form detected — performing login`);
-    const ok = await performLoginWith(page, token, totp, accountId);
+    console.log(`[ra=${rocketAccountId}] storage_state expired — performing login`);
+    const ok = await performLoginWith(page, token, totp, `ra=${rocketAccountId}`);
     if (!ok) {
       await context.close().catch(() => {});
-      await trackLoginFail(accountId);
-      throw new Error(`[${accountId}] login failed`);
+      await trackLoginFail(key, accountId);
+      throw new Error(`[ra=${rocketAccountId}] login failed`);
     }
-    consecutiveLoginFails.set(accountId, 0);  // успех — сбрасываем счётчик
-    await saveAccountStorage(accountId, context);
+    consecutiveLoginFails.set(key, 0);
+    await saveRocketAccountStorage(rocketAccountId, context);
   } else {
-    // Ни то ни другое за 15 сек — что-то не то. Делаем последний чек на индикатор
-    // (вдруг просто оч медленный рендер) и если нет — фейлим с диагностикой.
     const lastCheck = await page.locator(SELECTORS.loginSuccessIndicator)
       .first().isVisible({ timeout: 5000 }).catch(() => false);
     if (lastCheck) {
-      console.log(`[${accountId}] late indicator detected — assume logged in`);
-      consecutiveLoginFails.set(accountId, 0);
+      console.log(`[ra=${rocketAccountId}] late indicator detected — assume logged in`);
+      consecutiveLoginFails.set(key, 0);
     } else {
-      console.error(`[${accountId}] neither login form nor success indicator after 20s. URL=${page.url()}`);
+      console.error(`[ra=${rocketAccountId}] login state ambiguous after 20s. URL=${page.url()}`);
       try {
-        await captureScreenshot(page, `[${accountId}] login state ambiguous (URL=${page.url()})`, accountId);
+        await captureScreenshot(page, `[ra=${rocketAccountId}] login state ambiguous`, accountId);
       } catch {}
       await context.close().catch(() => {});
-      await trackLoginFail(accountId);
-      throw new Error(`[${accountId}] login state ambiguous — see screenshot`);
+      await trackLoginFail(key, accountId);
+      throw new Error(`[ra=${rocketAccountId}] login state ambiguous`);
     }
   }
 
-  const entry = { context, page, lastUsedAt: Date.now(), lastReloadAt: Date.now(), accountId };
-  accountContexts.set(accountId, entry);
+  const entry = {
+    context, page,
+    lastUsedAt: Date.now(),
+    lastReloadAt: Date.now(),
+    rocketAccountId,
+    accountId,                 // для логирования и notify
+    accountIdLabel: `ra=${rocketAccountId}`,
+  };
+  accountContexts.set(key, entry);
+  return entry;
+}
+
+/**
+ * LEGACY: контекст по accountId (используется если в job нет rocket_account_id).
+ * Делегирует на сервер /bot/account/:accountId/state — сервер вернёт первый
+ * rocket-аккаунт юзера. Хранится в той же мапе с key="acc:${accountId}".
+ */
+async function getAccountContext(browser, accountId) {
+  const key = `acc:${accountId}`;
+  const existing = accountContexts.get(key);
+  if (existing) {
+    if (existing.needsRelogin) {
+      try { await existing.context.close(); } catch {}
+      accountContexts.delete(key);
+    } else {
+      existing.lastUsedAt = Date.now();
+      return existing;
+    }
+  }
+  const creds = await fetchAccountCreds(accountId);
+  const token = creds?.token || LOGIN_TOKEN;
+  const totp = creds?.totp_secret || TOTP_SECRET;
+  const storageB64 = creds?.storage_state_base64 || '';
+  if (!token) throw new Error(`account ${accountId}: no rocket_token (заполни в Профиле)`);
+  let storageState;
+  if (storageB64) {
+    try { storageState = JSON.parse(Buffer.from(storageB64, 'base64').toString('utf-8')); }
+    catch {}
+  }
+  console.log(`[${accountId}] creating new browser context (legacy)`);
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    locale: 'ru-RU',
+    timezoneId: 'Europe/Moscow',
+    extraHTTPHeaders: { 'Accept-Language': 'ru-RU,ru;q=0.9' },
+    ...(storageState ? { storageState } : {}),
+  });
+  const page = await context.newPage();
+  page.on('response', (response) => {
+    try {
+      const status = response.status();
+      if ((status === 401 || status === 403) && response.url().includes('rocket.do')) {
+        const e2 = accountContexts.get(key);
+        if (e2 && !e2.needsRelogin) e2.needsRelogin = true;
+      }
+    } catch {}
+  });
+  try { await page.goto(REQUESTS_URL, { waitUntil: 'domcontentloaded' }); }
+  catch (e) { console.error(`[${accountId}] initial goto failed:`, e.message); }
+  const successPromise = page.locator(SELECTORS.loginSuccessIndicator)
+    .first().waitFor({ state: 'visible', timeout: 15_000 })
+    .then(() => 'success').catch(() => null);
+  const loginFormPromise = page.locator(SELECTORS.loginTokenInput)
+    .first().waitFor({ state: 'visible', timeout: 15_000 })
+    .then(() => 'login').catch(() => null);
+  const winner = await Promise.race([successPromise, loginFormPromise]);
+  if (winner === 'login') {
+    const ok = await performLoginWith(page, token, totp, accountId);
+    if (!ok) {
+      await context.close().catch(() => {});
+      await trackLoginFail(key, accountId);
+      throw new Error(`[${accountId}] login failed`);
+    }
+    await saveAccountStorage(accountId, context);
+  }
+  const entry = {
+    context, page,
+    lastUsedAt: Date.now(),
+    lastReloadAt: Date.now(),
+    rocketAccountId: null,
+    accountId,
+    accountIdLabel: accountId,
+  };
+  accountContexts.set(key, entry);
   return entry;
 }
 
@@ -319,12 +425,15 @@ async function getAccountContext(browser, accountId) {
  */
 async function cleanupIdleContexts() {
   const now = Date.now();
-  for (const [accountId, entry] of accountContexts) {
+  for (const [key, entry] of accountContexts) {
     if (now - entry.lastUsedAt > ACCOUNT_IDLE_MS) {
-      console.log(`[${accountId}] closing idle context (${Math.round((now - entry.lastUsedAt)/60000)} min idle)`);
-      try { await saveAccountStorage(accountId, entry.context); } catch {}
+      console.log(`[${entry.accountIdLabel}] closing idle context (${Math.round((now - entry.lastUsedAt)/60000)} min idle)`);
+      try {
+        if (entry.rocketAccountId) await saveRocketAccountStorage(entry.rocketAccountId, entry.context);
+        else await saveAccountStorage(entry.accountId, entry.context);
+      } catch {}
       try { await entry.context.close(); } catch {}
-      accountContexts.delete(accountId);
+      accountContexts.delete(key);
     }
   }
 }
@@ -829,10 +938,9 @@ async function scanForNewDeals(page, accountIdOrCtx) {
     accountId = ctxEntry.accountId || 'default';
   } else {
     accountId = accountIdOrCtx || 'default';
-    // Найдём ctxEntry по странице (для legacy single-tenant вызова)
     ctxEntry = { page, lastReloadAt: 0 };
-    for (const [aid, e] of accountContexts) {
-      if (e.page === page) { ctxEntry = e; accountId = aid; break; }
+    for (const [, e] of accountContexts) {
+      if (e.page === page) { ctxEntry = e; accountId = e.accountId; break; }
     }
   }
   console.log(`[${accountId}] background scan: checking deals`);
@@ -1149,40 +1257,44 @@ async function main() {
       continue;
     }
 
-    console.log(`picked job #${job.id} kind=${job.kind || 'confirm'} account=${job.account_id} source=${job.source} amount=${job.amount} card=${job.card_number || '—'}`);
+    console.log(`picked job #${job.id} kind=${job.kind || 'confirm'} account=${job.account_id} ra=${job.rocket_account_id || '—'} source=${job.source} amount=${job.amount} card=${job.card_number || '—'}`);
     let result;
+    // Routing: предпочитаем rocket_account_id (multi-rocket), иначе legacy accountId
+    const useRocketAccountId = job.rocket_account_id != null;
+    const getCtx = async () => useRocketAccountId
+      ? await getContextByRocketAccountId(browser, job.rocket_account_id)
+      : await getAccountContext(browser, job.account_id);
+    const saveStorage = async (entry) => useRocketAccountId
+      ? await saveRocketAccountStorage(job.rocket_account_id, entry.context)
+      : await saveAccountStorage(job.account_id, entry.context);
+
     try {
       if (job.kind === 'warmup') {
-        // Warmup: просто создать/получить контекст (это вызовет login + сохранит storage_state).
         if (MOCK_SITE) {
           result = { ok: true, reason: 'mock: warmup skipped' };
         } else {
-          const ctxEntry = await getAccountContext(browser, job.account_id);
-          await saveAccountStorage(job.account_id, ctxEntry.context);
+          const ctxEntry = await getCtx();
+          await saveStorage(ctxEntry);
           result = { ok: true };
-          console.log(`[${job.account_id}] warmup complete — session saved`);
+          console.log(`[${ctxEntry.accountIdLabel}] warmup complete — session saved`);
         }
       } else if (job.kind === 'scan') {
-        // Forced scan: создать/восстановить контекст, форсированно перезагрузить страницу,
-        // запустить scanForNewDeals. Игнорируем rate-limit reload'а.
         if (MOCK_SITE) {
           result = { ok: true, reason: 'mock: scan skipped' };
         } else {
-          const ctxEntry = await getAccountContext(browser, job.account_id);
-          // Сбрасываем lastReloadAt чтобы reloadWithRateLimit перезагрузил без ожидания
+          const ctxEntry = await getCtx();
           ctxEntry.lastReloadAt = 0;
-          await scanForNewDeals(ctxEntry.page, job.account_id);
+          await scanForNewDeals(ctxEntry.page, ctxEntry.accountId);
           result = { ok: true };
-          console.log(`[${job.account_id}] forced scan complete`);
+          console.log(`[${ctxEntry.accountIdLabel}] forced scan complete`);
         }
       } else {
         const ctxEntry = MOCK_SITE
-          ? { context: null, page: null, lastReloadAt: 0 }
-          : await getAccountContext(browser, job.account_id);
+          ? { context: null, page: null, lastReloadAt: 0, accountId: job.account_id, accountIdLabel: job.account_id }
+          : await getCtx();
         result = await tryConfirm(ctxEntry, job);
-        // После успешной обработки — сохраняем сессию в БД (могла обновиться)
         if (result.ok && !MOCK_SITE) {
-          await saveAccountStorage(job.account_id, ctxEntry.context);
+          await saveStorage(ctxEntry);
         }
       }
     } catch (e) {
@@ -1198,11 +1310,11 @@ async function main() {
 async function scanAllAccountsForNewDeals() {
   if (Date.now() - lastSiteScanAt < SITE_SCAN_INTERVAL_MS) return;
   lastSiteScanAt = Date.now();
-  for (const [accountId, entry] of accountContexts) {
+  for (const [, entry] of accountContexts) {
     try {
-      await scanForNewDeals(entry.page, accountId);
+      await scanForNewDeals(entry.page, entry.accountId);
     } catch (e) {
-      console.error(`[${accountId}] scan error:`, e.message);
+      console.error(`[${entry.accountIdLabel}] scan error:`, e.message);
     }
   }
 }
