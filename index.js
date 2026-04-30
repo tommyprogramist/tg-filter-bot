@@ -119,8 +119,21 @@ async function notify(type, payload = {}) {
 // Делает скриншот страницы и шлёт в Telegram через сервер
 async function captureScreenshot(page, caption = '', accountId = null) {
   try {
-    // JPEG quality 70 — заметно меньше PNG (~50-150 КБ vs 300-700 КБ для 1920×1080)
-    const buf = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 70 });
+    // Дать SPA время отрисоваться: ждём что body не пустой (минимум 50 символов).
+    // Иначе скриншот выходит белым потому что Vue ещё не bootstrap'нул.
+    try {
+      await page.waitForFunction(
+        () => (document.body?.innerText || '').replace(/\s+/g, '').length > 50,
+        { timeout: 8000 }
+      );
+    } catch {
+      console.warn('screenshot: body still empty after 8s, capturing anyway');
+    }
+    // Дополнительный буфер для финального layout
+    await page.waitForTimeout(300);
+    // JPEG quality 70 — заметно меньше PNG (~50-150 КБ vs 300-700 КБ для 1920×1080).
+    // fullPage=true чтобы увидеть весь контент (вдруг таблица сдвинута вниз).
+    const buf = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
     const base64 = buf.toString('base64');
     console.log(`screenshot taken: ${buf.length} bytes`);
     const r = await botFetch('/bot/screenshot', {
@@ -1081,6 +1094,25 @@ async function tryConfirm(ctxEntry, job) {
   //    с короткими retry'ями (заявка может появиться через секунду-две после пуша).
   if (!target) {
     await reloadWithRateLimit(ctxEntry, true);
+    // Дожидаемся что Vue SPA отрисовал что-то (body не пустой) — иначе мы будем
+    // искать row'ы по селектору в момент когда страница ещё bootstrap'ится, и
+    // получим 0 строк хотя данные потом появятся.
+    let bodyEmpty = false;
+    try {
+      await page.waitForFunction(
+        () => (document.body?.innerText || '').replace(/\s+/g, '').length > 50,
+        { timeout: 10_000 }
+      );
+    } catch {
+      bodyEmpty = true;
+      console.warn(`[${ctxEntry.accountIdLabel || '?'}] body still empty after 10s — context may be stuck (zombie tab)`);
+    }
+    // Если body пустой — пометим контекст для пересоздания, иначе следующий job
+    // тоже упрётся в эту же страницу.
+    if (bodyEmpty && ctxEntry && !ctxEntry.needsRelogin) {
+      ctxEntry.needsRelogin = true;
+      console.warn(`[${ctxEntry.accountIdLabel || '?'}] marking context for full recreate (next job will get fresh browser)`);
+    }
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
       target = await searchOnPage(page, job, requestedAtMs).catch(() => null);
       if (target) break;
@@ -1091,10 +1123,21 @@ async function tryConfirm(ctxEntry, job) {
   if (!target) {
     // Диагностика: выводим что бот реально видит на странице
     let totalRows = 0;
+    let pageUrl = '?';
+    let bodyPreview = '?';
+    let pageTitle = '?';
     try {
+      pageUrl = page.url();
+      pageTitle = await page.title().catch(() => '?');
+      // Ждём networkidle перед скриншотом — чтобы dashboard успел отрисоваться
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
       const allRows = page.locator(SELECTORS.rowSelector);
       totalRows = await allRows.count();
-      console.log(`DEBUG: ${totalRows} rows visible on page:`);
+      bodyPreview = await page.locator('body').innerText({ timeout: 2000 })
+        .catch(() => '').then(t => t.replace(/\s+/g, ' ').trim().slice(0, 300));
+
+      console.log(`DEBUG: ${totalRows} rows on page. URL=${pageUrl} title="${pageTitle}"`);
+      console.log(`  body preview: "${bodyPreview}"`);
       for (let i = 0; i < Math.min(totalRows, 15); i++) {
         const row = allRows.nth(i);
         const status = await row.locator(SELECTORS.rowStatusText).innerText().catch(() => '?');
@@ -1105,23 +1148,35 @@ async function tryConfirm(ctxEntry, job) {
         const active = isStatusActive(status);
         console.log(`  row[${i}]: status="${status}" amount="${amt}"→${parsed} time="${time}" device="${device}" active=${active}`);
       }
+
+      // Если страница ушла на /login — session протухла, помечаем для relogin
+      if (pageUrl.includes('/login') || /войти|sign\s*in|вход/i.test(bodyPreview)) {
+        console.warn(`[${ctxEntry.accountIdLabel || '?'}] page redirected to login — marking context for relogin`);
+        if (ctxEntry && !ctxEntry.needsRelogin) ctxEntry.needsRelogin = true;
+      }
     } catch (e) {
       console.error('debug dump failed:', e.message);
     }
 
-    // Скриншот для визуальной отладки
+    // Скриншот для визуальной отладки. Сначала прокручиваем наверх, ждём render.
+    try {
+      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+      await page.waitForTimeout(500);
+    } catch {}
     await captureScreenshot(
       page,
-      `❌ amount=${job.amount}: не найдена строка (видно ${totalRows} строк всего)`,
+      `❌ amount=${job.amount}: 0 строк (URL=${pageUrl.replace(/^https?:\/\//, '').slice(0, 60)})`,
       job.account_id
     );
 
     notify('failed', {
       accountId: job.account_id,
       amount: job.amount,
-      reason: `Не нашёл строку с суммой ${job.amount} в окне ±10 мин`,
+      reason: totalRows === 0
+        ? `Dashboard пустой (0 строк). Возможно сессия истекла или у trader-аккаунта нет активных сделок.`
+        : `Не нашёл строку с суммой ${job.amount} в окне ±10 мин`,
     });
-    return { ok: false, reason: `no row with amount=${job.amount} after reload` };
+    return { ok: false, reason: `no row with amount=${job.amount} after reload (totalRows=${totalRows})` };
   }
 
   // Лог в stdout — для дебага. В Telegram больше не шлём (шум), пользователь
