@@ -81,6 +81,9 @@ if (!BOT_API_KEY) {
 // Загружается в getAccountContext() при создании контекста.
 
 function botFetch(path, init = {}) {
+  const controller = new AbortController();
+  const timeoutMs = init.timeoutMs || 30_000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   return fetch(`${SERVER_URL}${path}`, {
     ...init,
     headers: {
@@ -88,17 +91,27 @@ function botFetch(path, init = {}) {
       'Content-Type': 'application/json',
       ...(init.headers || {}),
     },
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
 }
 
 async function fetchNext() {
-  const r = await botFetch('/bot/queue/next');
-  if (r.status === 204) return null;
-  if (!r.ok) {
-    console.error('queue/next failed:', r.status, await r.text().catch(() => ''));
+  try {
+    const r = await botFetch('/bot/queue/next', { timeoutMs: 15_000 });
+    if (r.status === 204) return null;
+    if (!r.ok) {
+      console.error('queue/next failed:', r.status, await r.text().catch(() => ''));
+      return null;
+    }
+    return r.json();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      console.error('fetchNext timeout: server did not respond in 15s');
+    } else {
+      console.error('fetchNext error:', e.message);
+    }
     return null;
   }
-  return r.json();
 }
 
 async function reportDone(id, success, error = null) {
@@ -154,8 +167,14 @@ async function captureScreenshot(page, caption = '', accountId = null) {
 
 function startHeartbeat() {
   setInterval(() => {
-    botFetch('/bot/heartbeat', { method: 'POST', body: JSON.stringify({}) })
-      .catch(e => console.error('heartbeat failed:', e.message));
+    botFetch('/bot/heartbeat', { method: 'POST', body: JSON.stringify({}), timeoutMs: 10_000 })
+      .catch(e => {
+        if (e.name === 'AbortError') {
+          console.error('heartbeat timeout: server did not respond in 10s');
+        } else {
+          console.error('heartbeat failed:', e.message);
+        }
+      });
   }, 10_000);
 }
 
